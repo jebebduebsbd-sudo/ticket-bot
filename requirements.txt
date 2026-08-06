@@ -1,0 +1,5 @@
+discord.py>=2.4
+asyncpg
+aiohttp
+anthropic
+python-dotenv
