@@ -53,6 +53,9 @@ TRANSCRIPT_CHANNEL_ID = int(os.getenv("TRANSCRIPT_CHANNEL_ID", "0") or "0") or T
 REPS_CHANNEL_ID = int(os.getenv("REPS_CHANNEL_ID", "1485262743492624578") or "0")
 # Role granted to a customer once they leave a review.
 CUSTOMER_ROLE_ID = int(os.getenv("CUSTOMER_ROLE_ID", "1485241355629367420") or "0")
+# Vouch counter: how far back to scan the reviews channel once, on first run, so
+# the running total starts from the +rep posts you already have (0 = don't scan).
+VOUCH_BACKFILL_LIMIT = int(os.getenv("VOUCH_BACKFILL_LIMIT", "5000") or "0")
 # Terms of Service channel — linked again at card checkout.
 TOS_CHANNEL_ID = int(os.getenv("TOS_CHANNEL_ID", "1485235773606199326") or "0")
 
@@ -413,6 +416,23 @@ CREATE TABLE IF NOT EXISTS compensations (
   reason TEXT NULL,
   granted_by BIGINT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Vouches: one row per +rep post in the reviews channel. Keyed by message id so
+-- the same post can never be counted twice, and deleting the post drops the count.
+CREATE TABLE IF NOT EXISTS vouches (
+  message_id BIGINT PRIMARY KEY,
+  guild_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_vouches_guild ON vouches (guild_id);
+
+-- One-off bookkeeping flags (e.g. "the vouch history has been counted").
+CREATE TABLE IF NOT EXISTS bot_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
@@ -5221,6 +5241,85 @@ async def refresh_ticket_control_message(channel: discord.TextChannel):
 _PLUS_REP_RE = re.compile(r"(?:^|[^\w])\+\s?rep\b", re.IGNORECASE)
 _MINUS_REP_RE = re.compile(r"(?:^|[^\w])[-–—]\s?rep\b", re.IGNORECASE)
 
+
+# ============================================================
+# VOUCH COUNTER — every +rep in the reviews channel
+# ============================================================
+async def vouch_total(guild_id: int) -> int:
+    row = await db_fetchrow("SELECT COUNT(*) AS n FROM vouches WHERE guild_id=$1", guild_id)
+    return int(row["n"]) if row else 0
+
+
+async def record_vouch(message: discord.Message) -> int | None:
+    """Count a +rep post. Returns the server's new vouch total, or None when this
+    message was already counted (so a re-processed post never inflates it)."""
+    if message.guild is None:
+        return None
+    try:
+        status = await db_execute(
+            "INSERT INTO vouches(message_id, guild_id, user_id, created_at) "
+            "VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING",
+            message.id, message.guild.id, message.author.id, message.created_at)
+    except Exception as e:
+        print("Vouch record failed:", e)
+        return None
+    # asyncpg reports "INSERT 0 0" when the conflict clause skipped the row.
+    if isinstance(status, str) and status.strip().endswith(" 0"):
+        return None
+    return await vouch_total(message.guild.id)
+
+
+async def uncount_vouch(message_id: int) -> None:
+    """Forget a vouch whose post was deleted, so removing a fake +rep also
+    removes it from the total."""
+    try:
+        await db_execute("DELETE FROM vouches WHERE message_id=$1", message_id)
+    except Exception as e:
+        print("Vouch removal failed:", e)
+
+
+_vouch_backfill_running = False
+
+
+async def backfill_vouches(guild: discord.Guild) -> None:
+    """Count the +rep posts already sitting in the reviews channel, once, so the
+    first new vouch is numbered correctly instead of starting at #1."""
+    global _vouch_backfill_running
+    if not (REPS_CHANNEL_ID and VOUCH_BACKFILL_LIMIT > 0) or _vouch_backfill_running:
+        return
+    flag = f"vouch_backfill:{guild.id}"
+    if await db_fetchrow("SELECT 1 FROM bot_meta WHERE key=$1", flag):
+        return
+    channel = await resolve_text_channel(guild, REPS_CHANNEL_ID)
+    if channel is None:
+        return
+    _vouch_backfill_running = True
+    found = 0
+    try:
+        async for msg in channel.history(limit=VOUCH_BACKFILL_LIMIT, oldest_first=True):
+            if msg.author.bot or not _PLUS_REP_RE.search(msg.content or ""):
+                continue
+            await db_execute(
+                "INSERT INTO vouches(message_id, guild_id, user_id, created_at) "
+                "VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING",
+                msg.id, guild.id, msg.author.id, msg.created_at)
+            found += 1
+    except Exception as e:
+        # Leave the flag unset so the next restart retries the scan.
+        print("Vouch backfill failed:", e)
+        return
+    finally:
+        _vouch_backfill_running = False
+    await db_execute(
+        "INSERT INTO bot_meta(key, value) VALUES ($1,$2) "
+        "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+        flag, str(found))
+    print(f"⭐ Vouch backfill: counted {found} existing +rep post(s) in #{channel.name}")
+
+
+# ============================================================
+# REVIEW HANDLING
+# ============================================================
 NEG_REVIEW_SYSTEM = (
     "You are a caring customer-support agent for AF SERVICES, a gaming-account shop. A customer "
     "just left a NEGATIVE review. Read it, briefly and specifically acknowledge their complaint, "
@@ -5294,12 +5393,20 @@ async def handle_review_post(message: discord.Message) -> None:
         await _reply_negative_review(message)
         return
 
-    # Positive review → heart it.
+    # Positive review → heart it and give it its number.
     if is_plus:
         try:
             await message.add_reaction("❤️")
         except Exception as e:
             print("Review react failed:", e)
+        total = await record_vouch(message)
+        if total is not None:
+            try:
+                await message.reply(
+                    f"🌟 That's vouch **#{total}** for AF SERVICES — thank you {member.mention}!",
+                    mention_author=False)
+            except Exception as e:
+                print("Vouch count reply failed:", e)
 
     # Grant the customer role (skip staff — they don't need it).
     if CUSTOMER_ROLE_ID and not is_staff(member):
@@ -5409,6 +5516,21 @@ async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason
 # ============================================================
 # FIRST STAFF RESPONSE + ACTIVITY
 # ============================================================
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    # A removed +rep (fake vouch, cleanup, self-delete) shouldn't stay in the total.
+    if REPS_CHANNEL_ID and payload.channel_id == REPS_CHANNEL_ID:
+        await uncount_vouch(payload.message_id)
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    # Same for a purge of the reviews channel.
+    if REPS_CHANNEL_ID and payload.channel_id == REPS_CHANNEL_ID:
+        for mid in payload.message_ids:
+            await uncount_vouch(mid)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if not message.guild or message.author.bot:
@@ -5735,6 +5857,11 @@ async def on_ready():
         if not loop.is_running():
             loop.start()
 
+    # Scanning the reviews channel can take a while, so never block startup on it.
+    guild = bot.get_guild(GUILD_ID)
+    if guild is not None:
+        asyncio.create_task(backfill_vouches(guild))
+
     print(f"✅ Ticket bot online as {bot.user}")
     print(f"🖼️  Asset dir: {ASSET_DIR}")
     print(f"🖼️  Logo found:   {os.path.exists(LOGO_PATH)}  ({LOGO_PATH})")
@@ -5752,6 +5879,10 @@ async def on_ready():
     print(f"🧾 Transcripts + order notices → "
           f"{'channel '+str(TRANSCRIPT_CHANNEL_ID) if TRANSCRIPT_CHANNEL_ID else 'OFF (set TRANSCRIPT_CHANNEL_ID or TICKET_LOG_CHANNEL_ID)'}")
     print(f"📧 Email letters:  {'ON' if EMAIL_LETTERS_ENABLED else 'OFF (EMAIL_LETTERS_ENABLED=0)'}")
+    vouches_now = await vouch_total(GUILD_ID)
+    print(f"⭐ Vouch counter:  "
+          f"{'ON (channel '+str(REPS_CHANNEL_ID)+')' if REPS_CHANNEL_ID else 'OFF (set REPS_CHANNEL_ID)'}"
+          f" • counted so far: {vouches_now}")
 
 
 bot.run(DISCORD_TOKEN)
