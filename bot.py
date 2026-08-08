@@ -679,10 +679,10 @@ async def lzt_search_market(category: str, budget: float | None = None,
     """Search live LZT.market listings we can buy & resell within a budget, ranked
     by how much the previous owner spent (VP for Valorant, V-Bucks for Fortnite) so
     the customer gets the richest account their budget allows.
-    `category` is 'valorant' or 'fortnite'. `budget` is the customer's max spend (EUR);
-    we cap the source price at budget / RESALE_MULTIPLIER. `pool` overrides how many
-    ranked items to return (used when we still need to filter by skin). Returns
-    {ok, items, error}."""
+    `category` is 'valorant' or 'fortnite'. `budget` is the account SOURCE-cost cap
+    (EUR) — it selects how stacked the accounts are; the shown price is that source
+    cost × RESALE_MULTIPLIER. `pool` overrides how many ranked items to return (used
+    when we still need to filter by skin). Returns {ok, items, error}."""
     out = {"ok": False, "items": [], "error": None}
     slug = LZT_MARKET_SLUGS.get(category.lower())
     if not slug:
@@ -692,7 +692,9 @@ async def lzt_search_market(category: str, budget: float | None = None,
     # gets the cheapest account that matches; otherwise pull the richest first.
     params: dict = {"order_by": "price_to_up" if cheapest else "price_to_down"}
     if budget and budget > 0:
-        params["pmax"] = round(budget / RESALE_MULTIPLIER, 2)
+        # Budget caps the SOURCE cost directly, so a €25 budget surfaces accounts
+        # worth up to €25 (genuinely stacked) rather than only ≤ €25/markup ones.
+        params["pmax"] = round(budget, 2)
     res = await _lzt_get(f"/{slug}", params)
     if not res["ok"]:
         out["error"] = res["error"]
@@ -5081,6 +5083,10 @@ def _build_ai_shop_prompt() -> str:
         "after payment. You only take the order up to payment/proof.\n"
         "- Card payments include a surcharge; the system computes the exact total — don't quote a "
         "card total yourself, just say card has a small fee and let the system post it.\n"
+        "- The customer's 'budget' selects how STACKED the account is (it caps the account's base "
+        "value, not the final price). The price shown on each account is higher than the budget "
+        "number, so NEVER promise it will cost their budget or say 'within €X' — just pull options "
+        "and let the system show each price.\n"
         "- 'skins' is for the specific things they want: Valorant/Fortnite cosmetics, OR Steam "
         "game titles (e.g. 'GTA V', 'CS2'). Put each requested item in the skins array.\n"
         "- When the customer names a cosmetic by a community NICKNAME, translate it to the "
