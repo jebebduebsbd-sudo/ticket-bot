@@ -1004,6 +1004,19 @@ _REGION_ALIASES = {
     "kr": ["kr", "korea"], "br": ["br", "brazil"], "latam": ["latam", "latin"],
     "tr": ["tr", "turkey"], "mena": ["mena", "middle east"],
 }
+# Games where listings carry a region and we default to EU unless the customer
+# asks for another region ("mostly EU, show NA when they say NA", etc.).
+RIOT_REGION_GAMES = {"valorant", "riot"}
+
+
+def _default_region(game: str, region: str | None) -> tuple[str | None, bool]:
+    """(region_to_use, explicitly_requested). Valorant defaults to EU when the
+    customer didn't specify a region; other games are left unfiltered."""
+    region = (region or "").strip().lower() or None
+    explicit = region is not None
+    if region is None and (game or "").lower() in RIOT_REGION_GAMES:
+        region = "eu"
+    return region, explicit
 
 
 def _region_matches(item: dict, region: str | None) -> bool:
@@ -1050,9 +1063,11 @@ def _generic_account_embed(category: str, item: dict) -> discord.Embed:
 
 
 def market_account_embed(category: str, item: dict, image_name: str | None = None,
-                         valorant_skin_names: list[str] | None = None) -> discord.Embed:
+                         valorant_skin_names: list[str] | None = None,
+                         show_price: bool = True) -> discord.Embed:
     """Customer-facing embed describing one account: stats + skins image + price.
-    Never exposes the sourcing marketplace. `image_name` is an attachment:// filename."""
+    Never exposes the sourcing marketplace. `image_name` is an attachment:// filename.
+    `show_price` is False for `/account_info`, where the owner sets the price manually."""
     src, resale = _resale_price(item)
 
     if category.lower() == "valorant":
@@ -1107,10 +1122,12 @@ def market_account_embed(category: str, item: dict, image_name: str | None = Non
     else:  # any other LZT category — render generically from the listing
         e = _generic_account_embed(category, item)
 
-    e.add_field(name="💶 Price", value=f"**€{resale:.0f}**", inline=True)
+    if show_price:
+        e.add_field(name="💶 Price", value=f"**€{resale:.0f}**", inline=True)
     if image_name:
         e.set_image(url=f"attachment://{image_name}")
-    e.set_footer(text="AF SERVICES • Prices include warranty & setup support")
+    e.set_footer(text="AF SERVICES • Prices include warranty & setup support"
+                 if show_price else "AF SERVICES • Account details")
     return e
 
 
@@ -1123,7 +1140,8 @@ async def _fetch_bytes(url: str) -> bytes | None:
         return None
 
 
-async def build_account_message(category: str, item: dict, idx: int = 0):
+async def build_account_message(category: str, item: dict, idx: int = 0,
+                                show_price: bool = True):
     """(embed, file|None) for one account. The skin preview is re-hosted through Discord
     so the customer never sees the source marketplace URL."""
     kind = "weapons" if category.lower() == "valorant" else "skins"
@@ -1137,7 +1155,7 @@ async def build_account_message(category: str, item: dict, idx: int = 0):
             file = discord.File(io.BytesIO(data), filename=image_name)
     val_skins = await _resolve_valorant_skins(item) if category.lower() == "valorant" else None
     embed = market_account_embed(category, item, image_name=image_name,
-                                 valorant_skin_names=val_skins)
+                                 valorant_skin_names=val_skins, show_price=show_price)
     return embed, file
 
 
@@ -2869,6 +2887,312 @@ class TicketControlView(discord.ui.View):
 
 
 # ============================================================
+# TICKET INTAKE — a short questionnaire per category before the ticket opens
+# ============================================================
+# Map free-text answers to a supported LZT category key, so a Custom Order can
+# search right after the modal without needing the AI to interpret the game.
+_GAME_ALIASES: list[tuple[tuple[str, ...], str]] = [
+    (("valorant", "valo", "val"), "valorant"),
+    (("league", "lol"), "lol"),
+    (("fortnite", "fn"), "fortnite"),
+    (("steam",), "steam"),
+    (("gta", "rockstar", "social club", "socialclub", "rdr", "red dead"), "rockstar"),
+    (("epic games", "epicgames", "epic"), "epicgames"),
+    (("minecraft", "mc"), "minecraft"),
+    (("roblox",), "roblox"),
+    (("fifa", "ea sports", "ea app", "origin", "ea"), "ea"),
+    (("ubisoft", "uplay"), "ubisoft"),
+    (("battle.net", "battlenet", "blizzard", "overwatch", "call of duty", "cod", "warzone", "diablo"), "battlenet"),
+    (("chatgpt", "openai", "gpt"), "chatgpt"),
+    (("supercell", "clash", "brawl"), "supercell"),
+    (("telegram",), "telegram"),
+    (("discord",), "discord"),
+    (("tiktok",), "tiktok"),
+    (("genshin", "mihoyo", "hoyo", "honkai"), "genshin"),
+    (("tarkov", "eft"), "tarkov"),
+    (("world of tanks", "wot"), "wot"),
+    (("spotify",), "spotify"),
+]
+
+
+def _match_game_key(text: str | None) -> str | None:
+    """Best-effort map of a customer's words to a supported category key."""
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    if t in LZT_MARKET_SLUGS:
+        return t
+    for needles, key in _GAME_ALIASES:
+        if any(n in t for n in needles):
+            return key
+    return None
+
+
+def _parse_amount(text: str | None) -> float | None:
+    """First number in the text (handles '€25', '20 eur', 'around 30')."""
+    m = re.search(r"\d+(?:[.,]\d+)?", text or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _parse_region(text: str | None) -> str | None:
+    """Canonical region key (eu/na/ap/…) from free text, or None."""
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    for key, aliases in _REGION_ALIASES.items():
+        if t == key or any(a in t for a in aliases):
+            return key
+    return None
+
+
+def _split_list(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return [s.strip() for s in re.split(r"[,\n]+", text) if s.strip()]
+
+
+_SHORT = discord.TextStyle.short
+_LONG = discord.TextStyle.paragraph
+
+# Per-category questions. Each field: (key, label, style, required, placeholder, max_length)
+_INTAKE_FIELDS: dict[str, list[tuple]] = {
+    "claim": [
+        ("product", "What product / account did you buy?", _SHORT, True, "e.g. Valorant account, Fortnite OG", 200),
+        ("order_id", "Order / invoice ID", _SHORT, True, "Your order ID (our only accepted proof)", 100),
+        ("email", "Email used at checkout (optional)", _SHORT, False, "name@email.com", 200),
+        ("notes", "Anything else? (optional)", _LONG, False, "Extra details for staff", 1000),
+    ],
+    "custom": [
+        ("game", "Which game / platform?", _SHORT, True, "Valorant, Fortnite, Steam, GTA…", 100),
+        ("budget", "Budget in EUR", _SHORT, True, "e.g. 25", 20),
+        ("region", "Region — EU / NA / AP… (optional)", _SHORT, False, "Valorant: defaults to EU", 30),
+        ("wants", "Specific skins / games you want? (optional)", _LONG, False, "e.g. Reaver Vandal — or GTA V, CS2", 1000),
+        ("notes", "Anything else? (optional)", _LONG, False, "Extra details", 500),
+    ],
+    "support": [
+        ("issue", "What's the problem?", _LONG, True, "Describe the issue clearly (what happened, when)", 1500),
+        ("order_id", "Original order ID (optional)", _SHORT, False, "Your order / invoice ID", 100),
+        ("product", "Which account / product? (optional)", _SHORT, False, "e.g. Valorant account", 200),
+        ("followed_guide", "Did you follow the security guide? (optional)", _SHORT, False, "Yes / No", 20),
+    ],
+}
+
+_INTAKE_TITLES = {
+    "claim": "Claim Your Order",
+    "custom": "Custom Order Details",
+    "support": "Support Request",
+}
+
+# (embed title, [(answer key, field label)]) used to echo the answers into the ticket.
+_INTAKE_SUMMARY: dict[str, tuple[str, list[tuple[str, str]]]] = {
+    "claim": ("🛒  Claim details", [("product", "Product"), ("order_id", "Order ID"),
+                                    ("email", "Checkout email"), ("notes", "Notes")]),
+    "custom": ("🛍️  Order request", [("game", "Game / Platform"), ("budget", "Budget (EUR)"),
+                                     ("region", "Region"), ("wants", "Wants"), ("notes", "Notes")]),
+    "support": ("🎫  Support request", [("issue", "Issue"), ("order_id", "Order ID"),
+                                       ("product", "Product"), ("followed_guide", "Followed guide?")]),
+}
+
+_MULTILINE_KEYS = {"notes", "issue", "wants"}
+
+
+def _intake_summary_embed(kind: str, user: discord.abc.User,
+                          answers: dict[str, str]) -> discord.Embed | None:
+    title, rows = _INTAKE_SUMMARY.get(kind, (None, []))
+    if not title:
+        return None
+    e = discord.Embed(title=title, color=AF_BLUE, description=f"Submitted by {user.mention}")
+    for key, label in rows:
+        val = (answers.get(key) or "").strip()
+        if val:
+            e.add_field(name=label, value=val[:1024], inline=key not in _MULTILINE_KEYS)
+    e.set_thumbnail(url=logo_ref())
+    e.set_footer(text="AF SERVICES • Ticket intake")
+    return e
+
+
+class IntakeModal(discord.ui.Modal):
+    """The per-category questionnaire shown when a customer picks a category."""
+    def __init__(self, kind: str):
+        super().__init__(title=_INTAKE_TITLES.get(kind, "Open a Ticket"))
+        self.kind = kind
+        self._inputs: dict[str, discord.ui.TextInput] = {}
+        for key, label, style, required, placeholder, max_len in _INTAKE_FIELDS.get(kind, []):
+            ti = discord.ui.TextInput(label=label, style=style, required=required,
+                                      placeholder=placeholder, max_length=max_len)
+            self.add_item(ti)
+            self._inputs[key] = ti
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = {key: (ti.value or "").strip() for key, ti in self._inputs.items()}
+        await _finalize_ticket_from_modal(interaction, self.kind, answers)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print("Intake modal error:", repr(error))
+        msg = "⚠️ Something went wrong opening your ticket — please try again."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+
+
+def _modal_for_kind(kind: str) -> IntakeModal:
+    return IntakeModal(kind)
+
+
+async def _create_ticket_channel(guild: discord.Guild, user: discord.abc.User,
+                                 kind: str) -> discord.TextChannel | None:
+    """Create the ticket channel + DB row + control message. Returns the channel,
+    or None if the category isn't configured. (Shared by the intake modals.)"""
+    cat_id = category_for_kind(kind)
+    category = guild.get_channel(cat_id)
+    if not isinstance(category, discord.CategoryChannel):
+        return None
+
+    num = await get_next_ticket_num(kind)
+    channel_name = make_channel_name(kind, user, num)
+
+    staff_role = get_staff_role(guild)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    channel = await guild.create_text_channel(
+        name=channel_name, category=category, overwrites=overwrites, reason="Ticket created")
+
+    await db_execute(
+        "INSERT INTO tickets(channel_id, guild_id, owner_id, kind, ticket_num, status) "
+        "VALUES ($1,$2,$3,$4,$5,'open')",
+        channel.id, guild.id, user.id, kind, num)
+
+    embed = ticket_embed(
+        kind=kind, owner_mention=user.mention, claimed_by_mention=None,
+        first_staff_seconds=None, footer_text="AF SERVICES • Status: Waiting for staff")
+    msg = await channel.send(content=user.mention, embed=embed,
+                             view=TicketControlView(channel.id), files=embed_files())
+    await db_execute("UPDATE tickets SET control_message_id=$1 WHERE channel_id=$2", msg.id, channel.id)
+    bot.add_view(TicketControlView(channel.id), message_id=msg.id)
+    return channel
+
+
+async def _custom_after_intake(channel: discord.TextChannel, user: discord.abc.User,
+                               answers: dict[str, str]) -> None:
+    """Custom Order: read the answers and show matching accounts immediately."""
+    game = _match_game_key(answers.get("game"))
+    budget = _parse_amount(answers.get("budget"))
+    region = _parse_region(answers.get("region"))
+    wants = _split_list(answers.get("wants"))
+
+    if game and budget and budget > 0:
+        await channel.send(f"🔎 Finding **{game_label(game)}** accounts within your budget — one moment…")
+        try:
+            await present_accounts(channel, game, budget, wants, region=region)
+        except Exception as e:
+            print("Custom intake search failed:", e)
+            await channel.send("I couldn't pull the stock just now — a staff member will help you shortly.")
+        return
+
+    # Missing/unclear game or budget → hand off to the AI assistant (or staff) to
+    # gather the rest. It reads the intake summary above for context.
+    if AI_ENABLED:
+        await channel.send(embed=make_buy_intro_embed())
+    else:
+        await channel.send(
+            "Thanks! A staff member will review your request above and pull up matching "
+            "accounts for you shortly.")
+
+
+async def _claim_after_intake(channel: discord.TextChannel, user: discord.abc.User,
+                              answers: dict[str, str]) -> None:
+    """Claim Order: verify the provided order right away, mirroring the AI intake tail."""
+    product = answers.get("product") or None
+    order_id = answers.get("order_id") or None
+    if not order_id:
+        await channel.send(embed=make_proof_checklist_embed("claim"))
+        return
+
+    if await order_already_delivered(order_id):
+        await channel.send("⚠️ That order has already been delivered. A staff member will check.")
+        return
+
+    verification = None
+    if REQUIRE_SELLAUTH and SELLAUTH_ENABLED:
+        verification = await sellauth_get_invoice(order_id)
+        if verification["ok"] and verification["found"] and not verification["paid"]:
+            await channel.send(
+                f"I found order `{order_id}` but it isn't marked paid yet "
+                f"(status: `{verification.get('status')}`). Ping staff once the payment completes.")
+            return
+
+    await db_execute(
+        "UPDATE tickets SET verified_order_id=$1, verified_product=$2, ai_handled=TRUE WHERE channel_id=$3",
+        order_id, product, channel.id)
+    await post_delivery_approval(channel, user, product, order_id, verification)
+
+
+async def _finalize_ticket_from_modal(interaction: discord.Interaction, kind: str,
+                                      answers: dict[str, str]) -> None:
+    """Runs after an intake modal is submitted: create the ticket, echo the answers,
+    then kick off the per-category flow."""
+    guild = interaction.guild
+    user = interaction.user
+    if guild is None:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # Re-check the one-open-ticket rule in case they opened one between selecting
+    # the category and submitting the modal.
+    existing = await db_fetchrow(
+        "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND status='open'",
+        guild.id, user.id)
+    if existing:
+        ch = guild.get_channel(int(existing["channel_id"]))
+        where = ch.mention if isinstance(ch, discord.TextChannel) else "your open ticket"
+        await interaction.followup.send(
+            f"You already have an open ticket: {where}\nPlease close it before opening another.",
+            ephemeral=True)
+        return
+
+    channel = await _create_ticket_channel(guild, user, kind)
+    if channel is None:
+        await interaction.followup.send(
+            "Ticket category isn't configured correctly — please ping a staff member.", ephemeral=True)
+        return
+
+    summary = _intake_summary_embed(kind, user, answers)
+    if summary is not None:
+        try:
+            await channel.send(embed=summary)
+        except Exception as e:
+            print("Intake summary post failed:", e)
+
+    try:
+        if kind == "custom":
+            await _custom_after_intake(channel, user, answers)
+        elif kind == "claim":
+            await _claim_after_intake(channel, user, answers)
+        else:  # support
+            await channel.send(embed=make_proof_checklist_embed("support"))
+    except Exception as e:
+        print(f"{kind} intake follow-up failed:", e)
+
+    await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+
+
+# ============================================================
 # PANEL SELECT VIEW
 # ============================================================
 class TicketPanelSelect(discord.ui.Select):
@@ -2895,8 +3219,8 @@ class TicketPanelSelect(discord.ui.Select):
         user = interaction.user
         kind = self.values[0]
 
-        # One open ticket per person, across every category. They must close
-        # their current ticket before opening a new one of any kind.
+        # One open ticket per person, across every category. Check before showing
+        # the modal so we don't collect answers we'd only reject.
         existing = await db_fetchrow(
             "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND status='open'",
             guild.id, user.id
@@ -2919,56 +3243,8 @@ class TicketPanelSelect(discord.ui.Select):
             await interaction.response.send_message("Ticket category not configured correctly.", ephemeral=True)
             return
 
-        num = await get_next_ticket_num(kind)
-        channel_name = make_channel_name(kind, user, num)
-
-        staff_role = get_staff_role(guild)
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        }
-        if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-        channel = await guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            reason="Ticket created"
-        )
-
-        await db_execute(
-            """
-            INSERT INTO tickets(channel_id, guild_id, owner_id, kind, ticket_num, status)
-            VALUES ($1,$2,$3,$4,$5,'open')
-            """,
-            channel.id, guild.id, user.id, kind, num
-        )
-
-        embed = ticket_embed(
-            kind=kind,
-            owner_mention=user.mention,
-            claimed_by_mention=None,
-            first_staff_seconds=None,
-            footer_text="AF SERVICES • Status: Waiting for staff"
-        )
-        msg = await channel.send(content=user.mention, embed=embed, view=TicketControlView(channel.id), files=embed_files())
-
-        await db_execute(
-            "UPDATE tickets SET control_message_id=$1 WHERE channel_id=$2",
-            msg.id, channel.id
-        )
-
-        bot.add_view(TicketControlView(channel.id), message_id=msg.id)
-
-        if kind == "custom" and AI_ENABLED:
-            await channel.send(embed=make_buy_intro_embed())
-        elif kind in ("claim", "support"):
-            # Tell the customer up front what proof they must provide so staff can
-            # verify and forward the ticket to the owner for the final hand-off.
-            await channel.send(embed=make_proof_checklist_embed(kind))
-
-        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        # Ask the category's questions first; the ticket is created on submit.
+        await interaction.response.send_modal(_modal_for_kind(kind))
 
 
 class TicketPanelView(discord.ui.View):
@@ -3378,11 +3654,12 @@ async def market_command(interaction: discord.Interaction, category: app_command
     await interaction.response.defer()
     count = max(1, min(count, 5))
     wanted = [s.strip() for s in re.split(r"[,\n]+", skins) if s.strip()] if skins else []
-    region = (region or "").strip().lower() or None
+    region, explicit_region = _default_region(category.value, region)
 
     # When filtering we scan a bigger pool; a specific request pulls cheapest-first.
-    specific = bool(wanted or region)
-    pool = MARKET_SCAN_DEEP if specific else count
+    # An auto EU default (Valorant) still filters but keeps richest-first ranking.
+    specific = bool(wanted or explicit_region)
+    pool = MARKET_SCAN_DEEP if (specific or region) else count
     res = await lzt_search_market(category.value, budget=budget, count=count, pool=pool,
                                   cheapest=specific)
     if not res["ok"]:
@@ -3442,7 +3719,7 @@ async def market_command(interaction: discord.Interaction, category: app_command
 
 
 @bot.tree.command(name="account_info",
-                  description="Show full details (skins, value, price) for one account.")
+                  description="Show full details (skins, value, region) for one account.")
 @app_commands.describe(item_id="Account listing/item ID")
 async def account_info_command(interaction: discord.Interaction, item_id: str):
     await interaction.response.defer()
@@ -3454,7 +3731,8 @@ async def account_info_command(interaction: discord.Interaction, item_id: str):
     cid = (item.get("category") or {}).get("category_id") or item.get("category_id")
     # Render Valorant/Fortnite richly; every other LZT category renders generically.
     category = "valorant" if cid == 13 else "fortnite" if cid == 9 else "generic"
-    embed, file = await build_account_message(category, item, 0)
+    # No price here — the owner prices these manually.
+    embed, file = await build_account_message(category, item, 0, show_price=False)
     view = skins_view_for([item], category) if category in ("valorant", "fortnite") else None
     kwargs = {"embed": embed, "files": [file] if file else []}
     if view is not None:
@@ -4724,9 +5002,12 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
                            wanted: list[str], count: int = 3, region: str | None = None) -> int:
     """Search, filter, and post matching accounts; remember them for selection.
     A specific request (named item/region) is shown cheapest-first. Returns count shown."""
-    region = (region or "").strip().lower() or None
-    specific = bool(wanted or region)
-    pool = MARKET_SCAN_DEEP if specific else count
+    region, explicit_region = _default_region(game, region)
+    # A named skin or an explicitly-chosen region means "specific" → cheapest-first.
+    # An auto EU default still filters, but keeps the richest-first ranking and needs
+    # a deep pool so there are enough EU listings to choose from.
+    specific = bool(wanted or explicit_region)
+    pool = MARKET_SCAN_DEEP if (specific or region) else count
     res = await lzt_search_market(game, budget=budget, count=count, pool=pool, cheapest=specific)
     if not res["ok"]:
         await channel.send(f"⚠️ I couldn't reach the stock right now (`{res['error']}`). "
@@ -4737,7 +5018,7 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
         bits = []
         if wanted:
             bits.append("matching " + ", ".join(wanted))
-        if region:
+        if explicit_region and region:
             bits.append(f"in {region.upper()}")
         extra = (" " + " ".join(bits)) if bits else ""
         await channel.send(
