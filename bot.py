@@ -667,8 +667,12 @@ def _spent_metric(category: str, item: dict) -> int:
     if c == "valorant":
         return int(item.get("riot_valorant_inventory_value") or 0)
     if c == "fortnite":
-        return sum(int(item.get(f"fortnite_shop_{k}_cost") or 0)
-                   for k in ("skins", "pickaxes", "dances", "gliders"))
+        vbucks_spent = sum(int(item.get(f"fortnite_shop_{k}_cost") or 0)
+                           for k in ("skins", "pickaxes", "dances", "gliders"))
+        skins = int(item.get("fortnite_skin_count") or 0)
+        # Show the most stacked first: weight skin count heavily (≈ one skin per
+        # 1000 V-Bucks) so accounts with more skins win, with V-Bucks spent breaking ties.
+        return skins * 1000 + vbucks_spent
     # Other games have no universal "spent" metric — rank by price (richest first).
     return int(float(item.get("price") or 0) * 100)
 
@@ -677,12 +681,13 @@ async def lzt_search_market(category: str, budget: float | None = None,
                             count: int = 3, pool: int | None = None,
                             cheapest: bool = False) -> dict:
     """Search live LZT.market listings we can buy & resell within a budget, ranked
-    by how much the previous owner spent (VP for Valorant, V-Bucks for Fortnite) so
-    the customer gets the richest account their budget allows.
-    `category` is 'valorant' or 'fortnite'. `budget` is the account SOURCE-cost cap
-    (EUR) — it selects how stacked the accounts are; the shown price is that source
-    cost × RESALE_MULTIPLIER. `pool` overrides how many ranked items to return (used
-    when we still need to filter by skin). Returns {ok, items, error}."""
+    by how stacked the account is so the customer gets the richest one their budget allows.
+    `category` is 'valorant' or 'fortnite'. `budget` is the customer's max spend (EUR);
+    the LZT source price is capped at budget / RESALE_MULTIPLIER so we can buy it cheap
+    and resell at ~budget. Within that cap, accounts are ranked most-stacked first
+    (Fortnite: most skins + V-Bucks spent; Valorant: skin/VP value). `pool` overrides how
+    many ranked items to return (used when we still need to filter by skin). Returns
+    {ok, items, error}."""
     out = {"ok": False, "items": [], "error": None}
     slug = LZT_MARKET_SLUGS.get(category.lower())
     if not slug:
@@ -692,9 +697,9 @@ async def lzt_search_market(category: str, budget: float | None = None,
     # gets the cheapest account that matches; otherwise pull the richest first.
     params: dict = {"order_by": "price_to_up" if cheapest else "price_to_down"}
     if budget and budget > 0:
-        # Budget caps the SOURCE cost directly, so a €25 budget surfaces accounts
-        # worth up to €25 (genuinely stacked) rather than only ≤ €25/markup ones.
-        params["pmax"] = round(budget, 2)
+        # The source price must be ~2.5x under the customer's budget so we buy cheap
+        # and resell at roughly their budget. (pmax is the LZT source-price ceiling.)
+        params["pmax"] = round(budget / RESALE_MULTIPLIER, 2)
     res = await _lzt_get(f"/{slug}", params)
     if not res["ok"]:
         out["error"] = res["error"]
@@ -5083,10 +5088,6 @@ def _build_ai_shop_prompt() -> str:
         "after payment. You only take the order up to payment/proof.\n"
         "- Card payments include a surcharge; the system computes the exact total — don't quote a "
         "card total yourself, just say card has a small fee and let the system post it.\n"
-        "- The customer's 'budget' selects how STACKED the account is (it caps the account's base "
-        "value, not the final price). The price shown on each account is higher than the budget "
-        "number, so NEVER promise it will cost their budget or say 'within €X' — just pull options "
-        "and let the system show each price.\n"
         "- 'skins' is for the specific things they want: Valorant/Fortnite cosmetics, OR Steam "
         "game titles (e.g. 'GTA V', 'CS2'). Put each requested item in the skins array.\n"
         "- When the customer names a cosmetic by a community NICKNAME, translate it to the "
