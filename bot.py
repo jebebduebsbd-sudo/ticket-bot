@@ -251,11 +251,12 @@ CRYPTO_CHOICES = {"LTC": "ltc", "SOL": "sol", "BTC": "btc", "ETH": "eth"}
 NP_PAID_STATUSES = {"confirmed", "sending", "finished", "partially_paid"}
 
 # --- Delivery policy ---
-# You chose "AI gathers + staff approves": payment is verified automatically but a
-# human clicks Approve before any account leaves stock. Set AUTO_DELIVER=1 to skip
-# the human step once SellAuth confirms payment.
+# "AI gathers + owner approves": payment is verified automatically but only the
+# OWNER (owner role) can release an account from stock — staff can verify, claim
+# and forward, never deliver. Set AUTO_DELIVER=1 to skip the human step once
+# SellAuth confirms payment.
 AUTO_DELIVER = os.getenv("AUTO_DELIVER", "0") not in ("0", "false", "False", "")
-# Require a verified SellAuth order before delivery is even offered to staff.
+# Require a verified SellAuth order before delivery is even offered for approval.
 REQUIRE_SELLAUTH = os.getenv("REQUIRE_SELLAUTH", "1") not in ("0", "false", "False", "")
 
 # --- Card payment example images (shown in /card) ---
@@ -277,13 +278,13 @@ ai_locks: set[int] = set()
 # channel_id -> [{"item_id", "price", "title", "game"}], most recent shown first.
 shop_offers: dict[int, list[dict]] = {}
 
-# --- Account delivery cooldown (per staff member) ---
-# A single staff member may release at most one account every
+# --- Account delivery cooldown (per deliverer) ---
+# A single person may release at most one account every
 # DELIVERY_COOLDOWN_SECONDS, so an accidental double-click or a rushed hand-out
 # can't fire twice back to back. Kept in memory (resets on restart, which is
 # fine — the cooldown is only meant to smooth out rapid-fire deliveries).
 DELIVERY_COOLDOWN_SECONDS = int(os.getenv("DELIVERY_COOLDOWN_SECONDS", "300") or "300")
-_staff_delivery_cooldown: dict[int, datetime] = {}
+_delivery_cooldown: dict[int, datetime] = {}
 
 
 def logo_ref() -> str:
@@ -679,15 +680,16 @@ def _spent_metric(category: str, item: dict) -> int:
 
 async def lzt_search_market(category: str, budget: float | None = None,
                             count: int = 3, pool: int | None = None,
-                            cheapest: bool = False) -> dict:
+                            cheapest: bool = False, title: str | None = None) -> dict:
     """Search live LZT.market listings we can buy & resell within a budget, ranked
     by how stacked the account is so the customer gets the richest one their budget allows.
     `category` is 'valorant' or 'fortnite'. `budget` is the customer's max spend (EUR);
     the LZT source price is capped at budget / RESALE_MULTIPLIER so we can buy it cheap
     and resell at ~budget. Within that cap, accounts are ranked most-stacked first
     (Fortnite: most skins + V-Bucks spent; Valorant: skin/VP value). `pool` overrides how
-    many ranked items to return (used when we still need to filter by skin). Returns
-    {ok, items, error}."""
+    many ranked items to return (used when we still need to filter by skin). `title`
+    filters listings by words in their title (how sellers advertise rare cosmetics).
+    Returns {ok, items, error}."""
     out = {"ok": False, "items": [], "error": None}
     slug = LZT_MARKET_SLUGS.get(category.lower())
     if not slug:
@@ -700,6 +702,8 @@ async def lzt_search_market(category: str, budget: float | None = None,
         # The source price must be ~2.5x under the customer's budget so we buy cheap
         # and resell at roughly their budget. (pmax is the LZT source-price ceiling.)
         params["pmax"] = round(budget / RESALE_MULTIPLIER, 2)
+    if title:
+        params["title"] = title.strip()
     res = await _lzt_get(f"/{slug}", params)
     if not res["ok"]:
         out["error"] = res["error"]
@@ -1605,8 +1609,9 @@ def _find_verification_code(text: str) -> str | None:
             best = cand
     if best and best[0] > 0:
         return best[2]
-    if labelled:
-        return labelled.group(1).upper()
+    # NOTE: a labelled match with no digit ("your code is below" → "below") is
+    # prose, not a code — the digit-bearing labelled case already returned above,
+    # so never surface the letter-only leftovers.
     return best[2] if best else None
 
 
@@ -1681,9 +1686,18 @@ def _fetch_emails_sync(host: str, address: str, password: str, limit: int) -> di
                     break
                 try:
                     typ, md = M.fetch(i, "(BODY.PEEK[])")
-                    if typ != "OK" or not md or not md[0] or not isinstance(md[0], tuple):
+                    if typ != "OK" or not md:
                         continue
-                    msg = message_from_bytes(md[0][1])
+                    # The literal with the raw letter is a (header, bytes) tuple, but
+                    # it is NOT always md[0]: many servers (mail.ru, rambler, outlook)
+                    # put untagged FLAGS/UID responses first. Take the first tuple
+                    # that actually carries bytes, or the letter silently vanishes.
+                    raw = next((p[1] for p in md
+                                if isinstance(p, tuple) and len(p) >= 2
+                                and isinstance(p[1], (bytes, bytearray)) and p[1]), None)
+                    if raw is None:
+                        continue
+                    msg = message_from_bytes(raw)
                     body = _email_body_text(msg)
                     subject = _decode_mime_header(msg.get("Subject"))
                     raw_date = (msg.get("Date") or "").strip()
@@ -2044,10 +2058,10 @@ async def deliver_account(
 ) -> bool:
     """Pull credentials from LZT for the given item and deliver them into the ticket.
     Guards against re-using an order. Returns True on success."""
-    # Per-staff delivery cooldown: block a staff member from releasing another
+    # Delivery cooldown: block the deliverer from releasing another
     # account until DELIVERY_COOLDOWN_SECONDS have passed since their last one.
     if delivered_by:
-        last = _staff_delivery_cooldown.get(delivered_by)
+        last = _delivery_cooldown.get(delivered_by)
         if last is not None:
             elapsed = (utcnow() - last).total_seconds()
             if elapsed < DELIVERY_COOLDOWN_SECONDS:
@@ -2134,10 +2148,10 @@ async def deliver_account(
     except Exception as e:
         print("post-purchase guide failed:", e)
 
-    # Start the staff member's cooldown only after a successful release, so a
+    # Start the deliverer's cooldown only after a successful release, so a
     # failed attempt (bad item id, etc.) never locks them out.
     if delivered_by:
-        _staff_delivery_cooldown[delivered_by] = utcnow()
+        _delivery_cooldown[delivered_by] = utcnow()
     return True
 
 
@@ -3261,7 +3275,7 @@ class TicketPanelView(discord.ui.View):
 
 
 # ============================================================
-# STAFF CHECK + COMMANDS
+# STAFF / OWNER CHECKS + COMMANDS
 # ============================================================
 def staff_only():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -3271,12 +3285,21 @@ def staff_only():
     return app_commands.check(predicate)
 
 
+def owner_only():
+    """Commands that release accounts: the shop owner only, never regular staff."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return False
+        return is_owner_member(interaction.user)
+    return app_commands.check(predicate)
+
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     # Without this handler, a failed check (e.g. staff-only) silently drops the
     # interaction and Discord shows "Application did not respond".
     if isinstance(error, app_commands.CheckFailure):
-        msg = "🚫 You don't have permission to use this command — staff only."
+        msg = "🚫 You don't have permission to use this command."
     else:
         msg = f"⚠️ Something went wrong while running this command:\n```{error}```"
         print("App command error:", repr(error))
@@ -3578,8 +3601,8 @@ async def find_account_command(interaction: discord.Interaction, category: app_c
 
 
 @bot.tree.command(name="deliver_next",
-                  description="Auto-pick the next VALID account in a category and deliver it into this ticket.")
-@staff_only()
+                  description="Auto-pick the next VALID account in a category and deliver it into this ticket (owner only).")
+@owner_only()
 @app_commands.describe(category="Game category the customer wants")
 @app_commands.choices(category=LZT_CATEGORY_CHOICES)
 async def deliver_next_command(interaction: discord.Interaction, category: app_commands.Choice[str]):
@@ -3680,6 +3703,13 @@ async def market_command(interaction: discord.Interaction, category: app_command
 
     # Scan deeply and rank: full matches first (cheapest), else best partial matches.
     chosen, full_match = await scan_and_rank(category.value, res["items"], wanted, region, count)
+    over_budget = False
+    if budget and wanted and not full_match:
+        # Same rule as the customer flow: specific items requested but nothing in
+        # budget has them all → show the cheapest account that does.
+        fb_chosen, fb_full = await find_cheapest_with_items(category.value, wanted, region, count)
+        if fb_full:
+            chosen, full_match, over_budget = fb_chosen, True, True
 
     cosmetic_game = category.value in ("valorant", "fortnite")
     if not chosen:
@@ -3701,7 +3731,10 @@ async def market_command(interaction: discord.Interaction, category: app_command
         if file:
             files.append(file)
 
-    if partial:
+    if over_budget:
+        header = (f"🛍️ **{category.name} accounts** — nothing under **€{budget:.0f}** has all the "
+                  f"requested items, so this is the **cheapest that does** (over budget)")
+    elif partial:
         header = f"🛍️ **{category.name} accounts** — closest matches (no single account had everything)"
     elif specific:
         header = f"🛍️ **{category.name} accounts** — cheapest match first"
@@ -3715,7 +3748,7 @@ async def market_command(interaction: discord.Interaction, category: app_command
         header += f" · matching **{', '.join(wanted)}**"
     if region:
         header += f" · region **{region.upper()}**"
-    if budget:
+    if budget and not over_budget:
         header += f" · within a **€{budget:.0f}** budget"
 
     view = skins_view_for(chosen, category.value) if cosmetic_game else None
@@ -4014,8 +4047,8 @@ async def verify_order_command(interaction: discord.Interaction, order_id: str):
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
-@bot.tree.command(name="deliver", description="Manually release an account into this ticket.")
-@staff_only()
+@bot.tree.command(name="deliver", description="Manually release an account into this ticket (owner only).")
+@owner_only()
 @app_commands.describe(
     item_id="Item ID to deliver (see /stock)",
     order_id="Optional SellAuth order ID (for the record / duplicate-protection)",
@@ -4657,10 +4690,11 @@ async def card_command(interaction: discord.Interaction):
 
 
 # ============================================================
-# STAFF APPROVAL / DELIVERY VIEW
-# Posted in a claim ticket once payment is (or could not be) verified. Staff
-# enters the LZT item id to release. custom_ids are static and the action reads
-# the ticket channel directly, so the buttons survive bot restarts.
+# OWNER APPROVAL / DELIVERY VIEW
+# Posted in a claim ticket once payment is (or could not be) verified. Only the
+# OWNER may approve — they enter the LZT item id to release; staff can only
+# reject. custom_ids are static and the action reads the ticket channel
+# directly, so the buttons survive bot restarts.
 # ============================================================
 APPROVE_DELIVER_CID = "af_approve_deliver"
 REJECT_DELIVER_CID = "af_reject_deliver"
@@ -4676,8 +4710,10 @@ class ApproveDeliverModal(discord.ui.Modal, title="Approve & Deliver"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-            await interaction.response.send_message("Staff only.", ephemeral=True)
+        if not interaction.guild or not isinstance(interaction.user, discord.Member) \
+                or not is_owner_member(interaction.user):
+            await interaction.response.send_message(
+                "Only the **owner** can deliver accounts.", ephemeral=True)
             return
         ch = interaction.channel
         if not isinstance(ch, discord.TextChannel):
@@ -4714,8 +4750,9 @@ class DeliveryApprovalView(discord.ui.View):
     @discord.ui.button(label="Approve & Deliver", style=discord.ButtonStyle.success,
                        emoji="✅", custom_id=APPROVE_DELIVER_CID)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-            await interaction.response.send_message("Staff only.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member) or not is_owner_member(interaction.user):
+            await interaction.response.send_message(
+                "Only the **owner** can deliver accounts.", ephemeral=True)
             return
         await interaction.response.send_modal(ApproveDeliverModal())
 
@@ -4733,8 +4770,8 @@ class DeliveryApprovalView(discord.ui.View):
 async def post_delivery_approval(channel: discord.TextChannel, owner: discord.abc.User,
                                  product: str | None, order_id: str | None,
                                  verification: dict | None) -> None:
-    """Drop the staff Approve/Reject panel into a claim ticket."""
-    staff_role = get_staff_role(channel.guild)
+    """Drop the owner's Approve/Reject panel into a claim ticket."""
+    owner_role = get_owner_role(channel.guild)
     if verification and verification.get("paid"):
         status_line = f"✅ **Payment verified** via SellAuth (status: `{verification.get('status')}`)."
     elif verification and verification.get("ok") and not verification.get("found"):
@@ -4745,19 +4782,21 @@ async def post_delivery_approval(channel: discord.TextChannel, owner: discord.ab
         status_line = "ℹ️ Manual verification (SellAuth not configured)."
 
     e = discord.Embed(
-        title="🛒  Ready to Deliver — Staff Approval",
+        title="🛒  Ready to Deliver — Owner Approval",
         description=(
             f"{status_line}\n\n"
             f"**Buyer:** {owner.mention}\n"
             f"**Product:** {product or 'unspecified'}\n"
             f"**Order ID:** {f'`{order_id}`' if order_id else 'not provided'}\n\n"
-            "Click **Approve & Deliver** and enter the account item ID to release the account."
+            "**Owner:** click **Approve & Deliver** and enter the account item ID to "
+            "release the account. Only the owner can deliver."
         ),
         color=AF_BLUE,
     )
     e.set_thumbnail(url=logo_ref())
-    e.set_footer(text="AF SERVICES • Staff action required")
-    content = staff_role.mention if staff_role else None
+    e.set_footer(text="AF SERVICES • Owner action required")
+    content = owner_role.mention if owner_role else (
+        f"<@{channel.guild.owner_id}>" if channel.guild.owner_id else None)
     await channel.send(content=content, embed=e, view=DeliveryApprovalView())
 
     # Auto restock alert: if this ticket reserved a market account and payment is verified,
@@ -5005,6 +5044,51 @@ async def scan_and_rank(game: str, items: list[dict], wanted: list[str],
     return [s[2] for s in scored[:count]], True
 
 
+async def find_cheapest_with_items(game: str, wanted: list[str], region: str | None,
+                                   count: int) -> tuple[list[dict], bool]:
+    """Budget-blind fallback: the CHEAPEST listings that really have the requested
+    item(s). Title-searches each requested item first (sellers advertise rare
+    cosmetics in the listing title, and a plain cheapest-first page would bury
+    them), then pads with the cheapest generic listings. scan_and_rank verifies
+    the cosmetics on the account itself, so a lying title can't slip through.
+    Returns (chosen, full_match) like scan_and_rank."""
+    candidates: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(items: list[dict]) -> None:
+        for it in items:
+            iid = _account_item_id(it)
+            if iid and iid not in seen:
+                seen.add(iid)
+                candidates.append(it)
+
+    # Official-name variants of each requested item, bounded so one request
+    # can't fan out into a pile of API calls.
+    queries: list[str] = []
+    for term in wanted:
+        for q in _expand_skin_query(term):
+            if q not in queries:
+                queries.append(q)
+    titled: list[dict] = []
+    for q in queries[:4]:
+        res = await lzt_search_market(game, budget=None, pool=MARKET_SCAN_DEEP,
+                                      cheapest=True, title=q)
+        if res["ok"]:
+            titled.extend(res["items"])
+    # Cheapest title-matched candidates first — they're the likeliest real hits,
+    # and the detail scan is capped, so they must not queue behind generic junk.
+    titled.sort(key=lambda it: float(it.get("price") or 1e9))
+    _add(titled)
+
+    res = await lzt_search_market(game, budget=None, pool=MARKET_SCAN_DEEP, cheapest=True)
+    if res["ok"]:
+        _add(res["items"])
+
+    if not candidates:
+        return [], False
+    return await scan_and_rank(game, candidates, wanted, region, count)
+
+
 async def present_accounts(channel: discord.TextChannel, game: str, budget: float | None,
                            wanted: list[str], count: int = 3, region: str | None = None) -> int:
     """Search, filter, and post matching accounts; remember them for selection.
@@ -5021,6 +5105,14 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
                            f"A staff member will help you shortly.")
         return 0
     chosen, full_match = await scan_and_rank(game, res["items"], wanted, region, count)
+    over_budget = False
+    if budget and wanted and not full_match:
+        # Nothing within the budget has everything they asked for — but they named
+        # specific items, so offer the cheapest account that really has them, even
+        # though it costs more than their budget.
+        fb_chosen, fb_full = await find_cheapest_with_items(game, wanted, region, count)
+        if fb_full:
+            chosen, full_match, over_budget = fb_chosen, True, True
     if not chosen:
         bits = []
         if wanted:
@@ -5048,7 +5140,10 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
     shop_offers[channel.id] = offers
 
     view = skins_view_for(chosen, game) if game in ("valorant", "fortnite") else None
-    if partial:
+    if over_budget:
+        lead = (f"Nothing within your **€{budget:.0f}** budget has everything you asked for, "
+                "so here's the **cheapest** account that does — it's **above your budget** 👇")
+    elif partial:
         lead = ("I couldn't find one account with **everything** you asked for within budget, so "
                 "here are the **closest matches** (cheapest first) 👇")
     elif specific:
@@ -5101,6 +5196,10 @@ def _build_ai_shop_prompt() -> str:
         "- If they mention a REGION (EU, NA, AP, KR, BR, LATAM, TR), put it in the region field.\n"
         "- When they ask for a SPECIFIC item/region, the system shows the CHEAPEST match for their "
         "budget — so never show an expensive account when a cheaper one fits.\n"
+        "- If NOTHING within their budget has the specific item(s) they asked for, the system "
+        "automatically shows the CHEAPEST account that does have them and labels it as over "
+        "budget. So still run the search (action \"search\") even when the budget seems too low "
+        "for the item — never refuse outright; the customer decides if they'll stretch.\n"
         "- Be warm, concise, human.\n\n"
         "Each turn, respond with ONLY a JSON object (no prose around it):\n"
         "{\n"
@@ -6160,7 +6259,7 @@ async def on_ready():
     print(f"🤖 AI intake:      {'ON ('+AI_MODEL+')' if AI_ENABLED else 'OFF (set ANTHROPIC_API_KEY)'}")
     print(f"💳 SellAuth:       {'ON (shop '+SELLAUTH_SHOP_ID+')' if SELLAUTH_ENABLED else 'OFF (set SELLAUTH_API_KEY + SELLAUTH_SHOP_ID)'}")
     print(f"📦 LZT.market:     {'ON' if LZT_ENABLED else 'OFF (set LZT_API_TOKEN)'}{'' if LZT_USER_ID else ' [LZT_USER_ID missing]'}")
-    print(f"🚚 Delivery:       {'AUTO' if AUTO_DELIVER else 'staff-approve'} • SellAuth required: {REQUIRE_SELLAUTH}")
+    print(f"🚚 Delivery:       {'AUTO' if AUTO_DELIVER else 'owner-approve'} • SellAuth required: {REQUIRE_SELLAUTH}")
     print(f"🛒 Resale/restock: x{RESALE_MULTIPLIER} markup • restock alerts → "
           f"{'channel '+str(RESTOCK_CHANNEL_ID) if RESTOCK_CHANNEL_ID else 'DM fallback (set RESTOCK_CHANNEL_ID)'}")
     print(f"💎 Crypto pay:     {'ON ('+NOWPAYMENTS_PRICE_CURRENCY+', LTC/SOL/BTC/ETH)' if NOWPAYMENTS_ENABLED else 'OFF (set NOWPAYMENTS_API_KEY)'}")
