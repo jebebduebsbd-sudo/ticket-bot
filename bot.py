@@ -18,6 +18,11 @@ try:
 except Exception:  # package not installed -> AI intake simply stays disabled
     AsyncAnthropic = None
 
+try:
+    from PIL import Image as PILImage
+except Exception:  # Pillow missing -> skin picture grids degrade to text lists
+    PILImage = None
+
 # Load a local .env if present (does not override real env vars on the host).
 try:
     from dotenv import load_dotenv
@@ -796,6 +801,9 @@ def _valorant_skin_names(item: dict) -> list[str]:
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _VAL_SKIN_MAP: dict[str, str] | None = None
+# Skin name (lowercase) → displayIcon URL, filled from the same API responses,
+# so skin lists can be rendered as PICTURES and not just names.
+_VAL_SKIN_ICONS: dict[str, str] = {}
 _val_skin_map_lock = asyncio.Lock()
 VALORANT_API_ENDPOINTS = (
     "https://valorant-api.com/v1/weapons/skins",
@@ -812,6 +820,7 @@ async def _valorant_skin_map() -> dict[str, str]:
         if _VAL_SKIN_MAP is not None:
             return _VAL_SKIN_MAP
         m: dict[str, str] = {}
+        icons: dict[str, str] = {}
         for url in VALORANT_API_ENDPOINTS:
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
@@ -824,12 +833,22 @@ async def _valorant_skin_map() -> dict[str, str]:
                     name = entry.get("displayName")
                     if uid and name:
                         m.setdefault(uid, str(name))
+                        icon = entry.get("displayIcon")
+                        if icon:
+                            icons.setdefault(str(name).lower(), str(icon))
             except Exception as e:
                 print("valorant-api fetch failed:", e)
         # Cache only a non-empty result so a transient failure can retry later.
         if m:
             _VAL_SKIN_MAP = m
+            _VAL_SKIN_ICONS.update(icons)
         return m
+
+
+async def _valorant_icon_map() -> dict[str, str]:
+    """Lowercase skin name → picture URL (loads the skin map on first use)."""
+    await _valorant_skin_map()
+    return _VAL_SKIN_ICONS
 
 
 def _dedup_keep_order(names: list[str]) -> list[str]:
@@ -908,6 +927,106 @@ async def build_cosmetic_sections(category: str, item: dict) -> dict[str, list[s
         if names:
             sections[label] = names
     return sections
+
+
+# ---- Cosmetic PICTURES — name → icon URL maps + grid composer ---------------
+# Fortnite icons come from fortnite-api.com (all BR cosmetics, keyed by name);
+# Valorant icons ride along with the UUID→name fetch above. Grids are composed
+# with Pillow so a page of skins is shown as pictures, not just a name list.
+_FN_ICON_MAP: dict[str, str] | None = None
+_fn_icon_lock = asyncio.Lock()
+FORTNITE_API_COSMETICS = "https://fortnite-api.com/v2/cosmetics/br"
+
+
+async def _fortnite_icon_map() -> dict[str, str]:
+    """Lowercase cosmetic name → picture URL for every Fortnite BR cosmetic."""
+    global _FN_ICON_MAP
+    if _FN_ICON_MAP is not None:
+        return _FN_ICON_MAP
+    async with _fn_icon_lock:
+        if _FN_ICON_MAP is not None:
+            return _FN_ICON_MAP
+        m: dict[str, str] = {}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+                async with s.get(FORTNITE_API_COSMETICS) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        for entry in (data.get("data") or []):
+                            name = entry.get("name")
+                            images = entry.get("images") or {}
+                            icon = images.get("smallIcon") or images.get("icon")
+                            if name and icon:
+                                m.setdefault(str(name).lower(), str(icon))
+        except Exception as e:
+            print("fortnite-api fetch failed:", e)
+        # Cache only a non-empty map so a transient failure can retry later.
+        if m:
+            _FN_ICON_MAP = m
+        return m
+
+
+async def _icons_for_names(game: str, names: list[str]) -> list[str | None]:
+    """Picture URL (or None) for each cosmetic name, per game."""
+    g = (game or "").lower()
+    if g == "valorant":
+        mp = await _valorant_icon_map()
+    elif g == "fortnite":
+        mp = await _fortnite_icon_map()
+    else:
+        return [None] * len(names)
+    return [mp.get(n.lower()) for n in names]
+
+
+# Small in-memory cache of icon image bytes, so flipping pager pages doesn't
+# refetch the same pictures over and over.
+_ICON_BYTES_CACHE: dict[str, bytes] = {}
+
+
+async def _icon_bytes(url: str | None) -> bytes | None:
+    if not url:
+        return None
+    if url in _ICON_BYTES_CACHE:
+        return _ICON_BYTES_CACHE[url]
+    data = await _fetch_bytes(url)
+    if data:
+        if len(_ICON_BYTES_CACHE) > 300:
+            _ICON_BYTES_CACHE.clear()
+        _ICON_BYTES_CACHE[url] = data
+    return data
+
+
+async def compose_skin_grid(game: str, names: list[str], tile: int = 128,
+                            cols: int = 4, max_items: int = 12) -> discord.File | None:
+    """One PNG grid picturing the given cosmetics, in list order (left→right,
+    top→bottom). Returns None when Pillow or every icon is unavailable, so
+    callers can quietly fall back to the text list."""
+    if PILImage is None or not names:
+        return None
+    names = names[:max_items]
+    urls = await _icons_for_names(game, names)
+    blobs = await asyncio.gather(*(_icon_bytes(u) for u in urls))
+    if not any(blobs):
+        return None
+    n = len(names)
+    cols = max(1, min(cols, n))
+    rows = (n + cols - 1) // cols
+    canvas = PILImage.new("RGBA", (cols * tile, rows * tile), (23, 27, 34, 255))
+    for i, blob in enumerate(blobs):
+        if not blob:
+            continue
+        try:
+            im = PILImage.open(io.BytesIO(blob)).convert("RGBA")
+            im.thumbnail((tile - 8, tile - 8))
+            x = (i % cols) * tile + (tile - im.width) // 2
+            y = (i // cols) * tile + (tile - im.height) // 2
+            canvas.paste(im, (x, y), im)
+        except Exception:
+            continue
+    buf = io.BytesIO()
+    canvas.save(buf, "PNG")
+    buf.seek(0)
+    return discord.File(buf, filename="skins_grid.png")
 
 
 # Community nicknames → official in-game name substrings. When a customer asks
@@ -1178,9 +1297,10 @@ def _account_item_id(item: dict) -> str:
 
 
 class CosmeticsPager(discord.ui.View):
-    """Ephemeral, paged view of an account's full cosmetic inventory.
+    """Ephemeral, paged view of an account's full cosmetic inventory, with a
+    composed PICTURE grid of the page's items (tiles follow the list order).
     Fortnite gets a category selector (Skins / Pickaxes / Emotes / …)."""
-    PAGE_SIZE = 20
+    PAGE_SIZE = 12  # 4×3 picture grid per page
 
     def __init__(self, category: str, title: str, sections: dict[str, list[str]]):
         super().__init__(timeout=600)
@@ -1229,11 +1349,28 @@ class CosmeticsPager(discord.ui.View):
             color=GUIDE_RIOT_COLOR if self.category == "valorant" else GUIDE_EPIC_COLOR,
         )
         self.prev_btn.disabled = self.next_btn.disabled = (pages <= 1)
-        e.set_footer(text=f"{label}: {len(lst)} total • Page {self.page + 1}/{pages}")
+        e.set_footer(text=f"{label}: {len(lst)} total • Page {self.page + 1}/{pages} • "
+                          f"pictures follow the list order")
         return e
 
+    async def render_page(self) -> tuple[discord.Embed, discord.File | None]:
+        """The page embed plus a composed picture grid of this page's cosmetics
+        (None when icons aren't resolvable — the text list still shows)."""
+        e = self.render()
+        start = self.page * self.PAGE_SIZE
+        chunk = self._cur()[start:start + self.PAGE_SIZE]
+        grid = await compose_skin_grid(self.category, chunk, max_items=self.PAGE_SIZE)
+        if grid is not None:
+            e.set_image(url=f"attachment://{grid.filename}")
+        return e, grid
+
     async def _refresh(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(embed=self.render(), view=self)
+        # Composing the picture grid can take a moment (icon fetches), so defer
+        # first and then swap the embed + attachment in one edit.
+        await interaction.response.defer()
+        e, grid = await self.render_page()
+        await interaction.edit_original_response(
+            embed=e, attachments=[grid] if grid else [], view=self)
 
     async def _prev(self, interaction: discord.Interaction):
         self.page = (self.page - 1) % self._page_count()
@@ -1280,7 +1417,9 @@ class ViewSkinsButton(discord.ui.DynamicItem[discord.ui.Button],
             return
         title = "Valorant Account" if self.cat == "valorant" else "Fortnite Account"
         pager = CosmeticsPager(self.cat, title, sections)
-        await interaction.followup.send(embed=pager.render(), view=pager, ephemeral=True)
+        embed, grid = await pager.render_page()
+        await interaction.followup.send(embed=embed, view=pager, ephemeral=True,
+                                        files=[grid] if grid else [])
 
 
 # ============================================================
@@ -1358,8 +1497,13 @@ class SkinCheckModal(discord.ui.Modal, title="Check skins on this account"):
             await interaction.followup.send(
                 f"⚠️ Couldn't check this account: `{res['error']}`", ephemeral=True)
             return
-        await interaction.followup.send(
-            embed=skin_check_embed(self.item_id, res["title"], res["results"]), ephemeral=True)
+        embed = skin_check_embed(self.item_id, res["title"], res["results"])
+        matched = [m for _, ms in res["results"] for m in ms]
+        grid = await compose_skin_grid(res["game"], matched)
+        if grid is not None:
+            embed.set_image(url=f"attachment://{grid.filename}")
+        await interaction.followup.send(embed=embed, ephemeral=True,
+                                        files=[grid] if grid else [])
 
 
 class CheckSkinsButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -3893,7 +4037,12 @@ async def check_skins_command(interaction: discord.Interaction, item_id: str, sk
     if not res["ok"]:
         await interaction.followup.send(f"⚠️ Stock error: `{res['error']}`", ephemeral=True)
         return
-    await interaction.followup.send(embed=skin_check_embed(item_id, res["title"], res["results"]))
+    embed = skin_check_embed(item_id, res["title"], res["results"])
+    matched = [m for _, ms in res["results"] for m in ms]
+    grid = await compose_skin_grid(res["game"], matched)
+    if grid is not None:
+        embed.set_image(url=f"attachment://{grid.filename}")
+    await interaction.followup.send(embed=embed, files=[grid] if grid else [])
 
 
 @bot.tree.command(name="reserve",

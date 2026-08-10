@@ -3,3 +3,4 @@ asyncpg
 aiohttp
 anthropic
 python-dotenv
+Pillow
