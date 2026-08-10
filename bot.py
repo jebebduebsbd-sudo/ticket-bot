@@ -5,7 +5,7 @@ import json
 import time
 import base64
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord.ext import commands, tasks
@@ -56,6 +56,14 @@ CUSTOMER_ROLE_ID = int(os.getenv("CUSTOMER_ROLE_ID", "1485241355629367420") or "
 # Vouch counter: how far back to scan the reviews channel once, on first run, so
 # the running total starts from the +rep posts you already have (0 = don't scan).
 VOUCH_BACKFILL_LIMIT = int(os.getenv("VOUCH_BACKFILL_LIMIT", "5000") or "0")
+# Reviews channel hygiene: require every post to carry a +rep/-rep tag. Posts
+# without one are removed and DM'd back to the author (with their text/images) so
+# they can repost with a tag. Repeat offenders get timed out.
+REVIEW_ENFORCE_REP = (os.getenv("REVIEW_ENFORCE_REP", "1") or "1").lower() not in ("0", "false", "no", "")
+# Time a member out after this many tag-less posts within the window (0 = never).
+REVIEW_SPAM_TIMEOUT_AFTER = int(os.getenv("REVIEW_SPAM_TIMEOUT_AFTER", "2") or "2")
+REVIEW_SPAM_TIMEOUT_MINUTES = int(os.getenv("REVIEW_SPAM_TIMEOUT_MINUTES", "10") or "10")
+REVIEW_SPAM_WINDOW_MINUTES = int(os.getenv("REVIEW_SPAM_WINDOW_MINUTES", "60") or "60")
 # Terms of Service channel — linked again at card checkout.
 TOS_CHANNEL_ID = int(os.getenv("TOS_CHANNEL_ID", "1485235773606199326") or "0")
 
@@ -195,6 +203,22 @@ def game_label(key: str) -> str:
     return LZT_GAME_LABELS.get((key or "").lower(), (key or "Account").title())
 # Resale markup: we sell to the customer at >= this multiple of the LZT source price.
 RESALE_MULTIPLIER = float(os.getenv("RESALE_MULTIPLIER", "2.5") or "2.5")
+# How many marketplace pages to scan when ranking accounts by "best value for the
+# budget", so cheaper-but-more-stacked listings on later pages still get considered.
+MARKET_RANK_PAGES = int(os.getenv("MARKET_RANK_PAGES", "3") or "3")
+# High budgets can afford a bigger markup: we buy relatively cheaper (deeper under
+# the budget) and keep more margin, while still ranking best-value within the cap.
+HIGH_BUDGET_EUR = float(os.getenv("HIGH_BUDGET_EUR", "30") or "30")
+HIGH_BUDGET_MULTIPLIER = float(os.getenv("HIGH_BUDGET_MULTIPLIER", "3") or "3")
+
+
+def _sourcing_markup(budget: float | None) -> float:
+    """Markup used to cap the source price under the customer's budget. Budgets at or
+    above HIGH_BUDGET_EUR use the bigger high-budget markup; everything else uses the
+    normal resale markup."""
+    if budget and budget >= HIGH_BUDGET_EUR:
+        return HIGH_BUDGET_MULTIPLIER
+    return RESALE_MULTIPLIER
 # Where "buy this now to restock" alerts go. If unset, the alert DMs the staff who triggered it.
 RESTOCK_CHANNEL_ID = int(os.getenv("RESTOCK_CHANNEL_ID", "0") or "0")
 
@@ -709,19 +733,41 @@ async def lzt_search_market(category: str, budget: float | None = None,
     # gets the cheapest account that matches; otherwise pull the richest first.
     params: dict = {"order_by": "price_to_up" if cheapest else "price_to_down"}
     if budget and budget > 0:
-        # The source price must be ~2.5x under the customer's budget so we buy cheap
-        # and resell at roughly their budget. (pmax is the LZT source-price ceiling.)
-        params["pmax"] = round(budget / RESALE_MULTIPLIER, 2)
-    res = await _lzt_get(f"/{slug}", params)
-    if not res["ok"]:
-        out["error"] = res["error"]
-        return out
-    items = (res["data"] or {}).get("items") or []
+        # The source price is capped at budget / markup so we buy cheap and stay within
+        # the customer's budget. High budgets use a bigger markup. (pmax = price ceiling.)
+        params["pmax"] = round(budget / _sourcing_markup(budget), 2)
+    # When ranking by "most stacked" we scan several pages, not just the most
+    # expensive one: a cheaper account often carries MORE skins than a pricier one,
+    # and grabbing only page 1 (priciest-first) hid those better-value listings.
+    # Cheapest-first (a specific request) already surfaces the right ones on page 1.
+    pages = 1 if cheapest else MARKET_RANK_PAGES
+    items: list[dict] = []
+    seen: set = set()
+    for p in range(1, pages + 1):
+        pp = dict(params)
+        if p > 1:
+            pp["page"] = p
+        res = await _lzt_get(f"/{slug}", pp)
+        if not res["ok"]:
+            if p == 1:
+                out["error"] = res["error"]
+                return out
+            break  # keep whatever earlier pages returned
+        batch = (res["data"] or {}).get("items") or []
+        if not batch:
+            break
+        for it in batch:
+            iid = it.get("item_id") or it.get("id")
+            if iid in seen:
+                continue
+            seen.add(iid)
+            items.append(it)
     if cheapest:
         # Cheapest matching account first (within budget).
         items.sort(key=lambda it: float(it.get("price") or 1e9))
     else:
-        # Richest first — most invested in the account for the budget.
+        # Best value for the budget: most stacked first (Fortnite → most skins +
+        # V-Bucks spent; Valorant → skin/VP value), not merely the most expensive.
         items.sort(key=lambda it: _spent_metric(category, it), reverse=True)
     limit = pool if pool else max(1, min(count, 5))
     out.update(ok=True, items=items[:max(1, limit)])
@@ -3569,6 +3615,78 @@ async def review_guide_cmd(interaction: discord.Interaction):
         f"✅ Posted and pinned the review guide in {channel.mention}.", ephemeral=True)
 
 
+@bot.tree.command(name="claim", description="Claim the current ticket (assign it to yourself).")
+@staff_only()
+async def claim_command(interaction: discord.Interaction):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+    row = await db_fetchrow(
+        "SELECT claimed_by, status FROM tickets WHERE channel_id=$1", channel.id)
+    if not row or row["status"] != "open":
+        await interaction.response.send_message("This isn't an open ticket.", ephemeral=True)
+        return
+    if row["claimed_by"] is not None:
+        claimer = interaction.guild.get_member(int(row["claimed_by"])) if interaction.guild else None
+        who = claimer.mention if claimer else f"<@{int(row['claimed_by'])}>"
+        await interaction.response.send_message(
+            f"This ticket is already claimed by {who}.", ephemeral=True)
+        return
+    await db_execute(
+        "UPDATE tickets SET claimed_by=$1, last_activity=NOW() WHERE channel_id=$2",
+        interaction.user.id, channel.id)
+    try:
+        await hide_ticket_from_other_staff(channel, interaction.user)
+    except Exception as e:
+        print("Claim permission update failed:", e)
+    await interaction.response.send_message("✅ Ticket claimed.", ephemeral=True)
+    try:
+        await channel.send(f"✅ Ticket claimed by {interaction.user.mention}.")
+        await refresh_ticket_control_message(channel)
+    except Exception as e:
+        print("Claim announce failed:", e)
+
+
+@bot.tree.command(name="setprice",
+                  description="Set the customer's price (custom) and post their checkout.")
+@staff_only()
+@app_commands.describe(amount="Account price in EUR (card adds its fee automatically)")
+async def setprice_command(interaction: discord.Interaction, amount: float):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("Enter a price greater than 0.", ephemeral=True)
+        return
+    row = await db_fetchrow(
+        "SELECT checkout_method FROM tickets WHERE channel_id=$1", channel.id)
+    if not row:
+        await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
+        return
+    method = (row["checkout_method"] or "").lower()
+    await interaction.response.defer(ephemeral=True)
+    if method == "crypto":
+        await post_crypto_checkout(channel, amount)
+        await interaction.followup.send(
+            f"✅ Posted the crypto checkout for €{amount:.2f}.", ephemeral=True)
+    elif method == "card":
+        await post_card_checkout(channel, amount)
+        await interaction.followup.send(
+            f"✅ Posted the card checkout (account €{amount:.2f} + card fee).", ephemeral=True)
+    else:
+        # No payment method chosen yet → store the price and ask how they'll pay.
+        await db_execute(
+            "UPDATE tickets SET checkout_total=$1 WHERE channel_id=$2", amount, channel.id)
+        await channel.send(
+            f"💶 Your price is set to **€{amount:.2f}**. Would you like to pay by "
+            f"**crypto** or **card**?")
+        await interaction.followup.send(
+            f"✅ Price set to €{amount:.2f} — waiting on the customer's payment method.",
+            ephemeral=True)
+
+
 # ============================================================
 # STOCK / DELIVERY / VERIFICATION COMMANDS
 # ============================================================
@@ -3762,7 +3880,8 @@ async def market_command(interaction: discord.Interaction, category: app_command
 
     embeds, files = [], []
     for i, item in enumerate(chosen):
-        embed, file = await build_account_message(category.value, item, i)
+        # No price shown — the owner sets custom prices; cost stays in the background.
+        embed, file = await build_account_message(category.value, item, i, show_price=False)
         embeds.append(embed)
         if file:
             files.append(file)
@@ -5081,6 +5200,25 @@ async def post_card_checkout(channel: discord.TextChannel, account_price: float)
     await channel.send(embed=e)
 
 
+async def notify_staff_set_price(channel: discord.TextChannel, method: str) -> None:
+    """Ping the handler (the claimer, or the staff role) to set a custom price with
+    /setprice, which then posts the customer's checkout."""
+    who = None
+    row = await db_fetchrow("SELECT claimed_by FROM tickets WHERE channel_id=$1", channel.id)
+    if row and row["claimed_by"]:
+        who = f"<@{int(row['claimed_by'])}>"
+    elif STAFF_ROLE_ID:
+        who = f"<@&{STAFF_ROLE_ID}>"
+    prefix = f"{who} " if who else ""
+    try:
+        await channel.send(
+            f"{prefix}⚙️ Customer chose **{method}** — set their price with "
+            f"`/setprice <amount>` to post the checkout.",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=True))
+    except Exception as e:
+        print("Set-price nudge failed:", e)
+
+
 MARKET_SCAN_DEEP = 40  # how many listings to inspect when filtering a specific request
 
 
@@ -5155,7 +5293,10 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
 
     embeds, files, offers = [], [], []
     for i, item in enumerate(chosen):
-        embed, file = await build_account_message(game, item, i)
+        # No price shown to the customer — every account here already fits their
+        # budget, and the owner sets the final (custom) price. The cost is still
+        # computed in the background (stored in `offers` below) for checkout/sourcing.
+        embed, file = await build_account_message(game, item, i, show_price=False)
         embed.title = f"#{i + 1} • {embed.title}"  # number for easy selection
         embeds.append(embed)
         if file:
@@ -5169,14 +5310,15 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
     view = skins_view_for(chosen, game) if game in ("valorant", "fortnite") else None
     if partial:
         lead = ("I couldn't find one account with **everything** you asked for within budget, so "
-                "here are the **closest matches** (cheapest first) 👇")
+                "here are the **closest matches** 👇")
     elif specific:
-        lead = "Here are the cheapest matches 👇"
+        lead = "Here are the best matches 👇"
     else:
         lead = "Here are the best matches 👇"
     kwargs = {
-        "content": f"{lead} Reply with the **number** of the one you want, "
-                   "or ask me to adjust the budget.",
+        "content": f"{lead} These all fit **within your budget**. Reply with the "
+                   "**number** of the one you want and how you'd like to pay, or ask "
+                   "me to adjust the budget.",
         "embeds": embeds[:10], "files": files,
     }
     if view is not None:
@@ -5205,8 +5347,10 @@ def _build_ai_shop_prompt() -> str:
         "- NEVER invent account details, skins, or prices. The system shows real accounts.\n"
         "- NEVER reveal or promise account logins/credentials — the OWNER always delivers those "
         "after payment. You only take the order up to payment/proof.\n"
-        "- Card payments include a surcharge; the system computes the exact total — don't quote a "
-        "card total yourself, just say card has a small fee and let the system post it.\n"
+        "- Prices are CUSTOM — the OWNER sets each price. NEVER quote, estimate, or promise any "
+        "price or total to the customer. Just reassure them the account fits their budget and the "
+        "owner will confirm the exact price. Card adds a small fee, applied automatically once the "
+        "price is set. The system posts all payment details — never post a number yourself.\n"
         "- 'skins' is for the specific things they want: Valorant/Fortnite cosmetics, OR Steam "
         "game titles (e.g. 'GTA V', 'CS2'). Put each requested item in the skins array.\n"
         "- When the customer names a cosmetic by a community NICKNAME, translate it to the "
@@ -5237,7 +5381,8 @@ def _build_ai_shop_prompt() -> str:
         "2. Have game + budget → action \"search\" (reply: tell them you're pulling options).\n"
         "3. They pick one (e.g. 'the 2nd', '#1') → action \"select\" with index (reply: confirm the "
         "pick, ask whether they want to pay by crypto or card).\n"
-        "4. They choose a method → action \"checkout\" with method (reply: tell them the checkout is below).\n"
+        "4. They choose a method → action \"checkout\" with method (reply: tell them the owner will "
+        "confirm the exact price and their payment details will appear here shortly — do NOT state a price).\n"
         "CRITICAL: Always use the customer's MOST RECENT budget and game. If they change the budget "
         "or game at ANY point — even after you've already shown options or they picked one (e.g. they "
         "first said €1.3 then say €20, or switch from Valorant to Steam) — treat it as a brand-new "
@@ -5321,21 +5466,31 @@ async def run_ai_shopping(channel: discord.TextChannel, owner: discord.abc.User)
     elif action == "checkout":
         method = str(data.get("method") or "").lower()
         row = await db_fetchrow(
-            "SELECT reserved_market_item_id FROM tickets WHERE channel_id=$1", channel.id)
+            "SELECT reserved_market_item_id, checkout_total FROM tickets WHERE channel_id=$1",
+            channel.id)
         if not row or not row["reserved_market_item_id"]:
             await channel.send("First let me know which account you'd like, then we'll set up payment.")
             return
-        det = await lzt_item_detail(row["reserved_market_item_id"])
-        if not det["ok"]:
-            await channel.send("Hmm, I couldn't load that account just now — a staff member will help.")
-            return
-        _, price = _resale_price(det["item"] or {})
-        if method == "crypto":
-            await post_crypto_checkout(channel, price)
-        elif method == "card":
-            await post_card_checkout(channel, price)
-        else:
+        if method not in ("crypto", "card"):
             await channel.send("Would you like to pay by **crypto** or **card**?")
+            return
+        # Prices are custom — the owner sets them. Record the chosen method; if the
+        # owner already set a price, post the checkout now, otherwise wait for /setprice.
+        await db_execute(
+            "UPDATE tickets SET checkout_method=$1, last_activity=NOW() WHERE channel_id=$2",
+            method, channel.id)
+        preset = row["checkout_total"]
+        if preset is not None:
+            price = float(preset)
+            if method == "crypto":
+                await post_crypto_checkout(channel, price)
+            else:
+                await post_card_checkout(channel, price)
+        else:
+            await channel.send(
+                f"Got it — **{method}** payment. 🧾 The owner will confirm your exact price in a "
+                f"moment, then I'll post your payment details right here. One sec! 🙏")
+            await notify_staff_set_price(channel, method)
 
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -5824,11 +5979,109 @@ async def _reply_negative_review(message: discord.Message) -> None:
         print("Negative-review reply send failed:", e)
 
 
+async def _grant_customer_role_and_close(guild: discord.Guild, member: discord.Member) -> None:
+    """Give the customer role (skip staff) and auto-close their open ticket(s)."""
+    if CUSTOMER_ROLE_ID and not is_staff(member):
+        role = guild.get_role(CUSTOMER_ROLE_ID)
+        if role and role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Left a review")
+            except Exception as e:
+                print("Customer role grant failed:", e)
+    rows = await db_fetch(
+        "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND status='open'",
+        guild.id, member.id)
+    for r in rows:
+        ch = guild.get_channel(int(r["channel_id"]))
+        if isinstance(ch, discord.TextChannel):
+            try:
+                await ch.send("🌟 Thanks for your review! Closing this ticket now.")
+                await close_ticket_flow(
+                    ch, closed_by=f"Auto-close (review by {member})",
+                    reason="Customer left a review ✅")
+            except Exception as e:
+                print("Review auto-close failed:", e)
+
+
+# Recent tag-less posts per author (in-memory), for the timeout escalation.
+_rep_spam_hits: dict[int, list[datetime]] = {}
+
+
+async def bounce_non_rep_post(message: discord.Message) -> None:
+    """A post in the reviews channel with no +rep/-rep tag isn't a trackable review
+    and just clutters the channel. Save the author's text + images, delete the post,
+    and DM it back so they can repost it WITH a tag. Repeat offenders get timed out."""
+    guild = message.guild
+    member = message.author
+    if guild is None or not isinstance(member, discord.Member):
+        return
+    text = (message.content or "").strip()
+    # Grab their attachments first (so we can hand them back) — the message is
+    # about to be deleted.
+    saved: list[discord.File] = []
+    for a in message.attachments[:5]:
+        try:
+            data = await _fetch_bytes(a.url)
+            if data:
+                saved.append(discord.File(io.BytesIO(data), filename=a.filename))
+        except Exception:
+            pass
+    try:
+        await message.delete()
+    except Exception as e:
+        print("Could not delete tag-less review post:", e)
+
+    # Escalate to a timeout if they keep doing it within the window.
+    timed_out = False
+    if REVIEW_SPAM_TIMEOUT_AFTER > 0 and not is_staff(member):
+        now = utcnow()
+        window = timedelta(minutes=REVIEW_SPAM_WINDOW_MINUTES)
+        hits = [t for t in _rep_spam_hits.get(member.id, []) if now - t < window]
+        hits.append(now)
+        if len(hits) >= REVIEW_SPAM_TIMEOUT_AFTER:
+            try:
+                await member.timeout(
+                    timedelta(minutes=REVIEW_SPAM_TIMEOUT_MINUTES),
+                    reason="Repeatedly posting in the reviews channel without a +rep/-rep")
+                timed_out = True
+                hits = []  # reset after acting
+            except Exception as e:
+                print("Review spam timeout failed:", e)
+        _rep_spam_hits[member.id] = hits
+
+    reps = f"<#{REPS_CHANNEL_ID}>" if REPS_CHANNEL_ID else "the reviews channel"
+    ready = (text or "<your review>")[:900]
+    desc = (
+        f"Every post in {reps} needs a **+rep** (or **-rep**) tag so we can track it — "
+        f"yours didn't have one, so I removed it to keep the channel tidy. Nothing's lost — "
+        f"here's your message back. 👇\n\n"
+        f"**Just repost it with the tag**, like this:\n```\n+rep ⭐⭐⭐⭐⭐\n{ready}\n```"
+    )
+    if saved:
+        desc += "\n📸 Your image(s) are attached — re-upload them with your review."
+    if timed_out:
+        desc += (f"\n\n⏳ You've been timed out for **{REVIEW_SPAM_TIMEOUT_MINUTES} min** for "
+                 f"repeated posts without a tag. You can post your review once it lifts.")
+    embed = discord.Embed(title="⭐ Please add +rep or -rep", description=desc, color=AF_BLUE)
+    try:
+        await member.send(embed=embed, files=saved)
+    except Exception:
+        # DM closed → brief self-deleting note in the channel.
+        try:
+            await message.channel.send(
+                f"{member.mention} Please include a **+rep** or **-rep** in your review so we "
+                f"can track it — your post was removed. Repost it with the tag. 🙏",
+                delete_after=30)
+        except Exception:
+            pass
+
+
 async def handle_review_post(message: discord.Message) -> None:
     """Handle a post in the reviews/reps channel.
     -rep → read it and reply offering compensation (keep the ticket OPEN).
-    otherwise (a +rep or plain review) → ❤️ react (on +rep), grant the customer
-    role, and auto-close the customer's open ticket(s)."""
+    +rep → ❤️ react, count the vouch, grant the customer role, auto-close ticket(s).
+    Any post without a +rep/-rep tag is removed and DM'd back so the author can
+    repost it with a tag (unless REVIEW_ENFORCE_REP is off)."""
     guild = message.guild
     member = message.author
     if guild is None or not isinstance(member, discord.Member):
@@ -5866,7 +6119,7 @@ async def handle_review_post(message: discord.Message) -> None:
         await _reply_negative_review(message)
         return
 
-    # Positive review → heart it and give it its number.
+    # Positive review → heart it, count the vouch, grant role, close their tickets.
     if is_plus:
         try:
             await message.add_reaction("❤️")
@@ -5881,30 +6134,18 @@ async def handle_review_post(message: discord.Message) -> None:
                     mention_author=False)
             except Exception as e:
                 print("Vouch count reply failed:", e)
+        await _grant_customer_role_and_close(guild, member)
+        return
 
-    # Grant the customer role (skip staff — they don't need it).
-    if CUSTOMER_ROLE_ID and not is_staff(member):
-        role = guild.get_role(CUSTOMER_ROLE_ID)
-        if role and role not in member.roles:
-            try:
-                await member.add_roles(role, reason="Left a review")
-            except Exception as e:
-                print("Customer role grant failed:", e)
-
-    # Auto-close their open tickets (thanks them + saves/DMs the transcript).
-    rows = await db_fetch(
-        "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND status='open'",
-        guild.id, member.id)
-    for r in rows:
-        ch = guild.get_channel(int(r["channel_id"]))
-        if isinstance(ch, discord.TextChannel):
-            try:
-                await ch.send("🌟 Thanks for your review! Closing this ticket now.")
-                await close_ticket_flow(
-                    ch, closed_by=f"Auto-close (review by {member})",
-                    reason="Customer left a review ✅")
-            except Exception as e:
-                print("Review auto-close failed:", e)
+    # Neither +rep nor -rep. Staff can chat freely here; a customer's tag-less post
+    # is bounced back so they repost it with a tag (keeps the channel spam-free and
+    # every review trackable). With enforcement off, keep the old lenient behaviour.
+    if not REVIEW_ENFORCE_REP:
+        await _grant_customer_role_and_close(guild, member)
+        return
+    if is_staff(member):
+        return
+    await bounce_non_rep_post(message)
 
 
 async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason: str):
