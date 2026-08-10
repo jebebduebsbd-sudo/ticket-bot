@@ -5,7 +5,7 @@ import json
 import time
 import base64
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord.ext import commands, tasks
@@ -56,6 +56,14 @@ CUSTOMER_ROLE_ID = int(os.getenv("CUSTOMER_ROLE_ID", "1485241355629367420") or "
 # Vouch counter: how far back to scan the reviews channel once, on first run, so
 # the running total starts from the +rep posts you already have (0 = don't scan).
 VOUCH_BACKFILL_LIMIT = int(os.getenv("VOUCH_BACKFILL_LIMIT", "5000") or "0")
+# Reviews channel hygiene: require every post to carry a +rep/-rep tag. Posts
+# without one are removed and DM'd back to the author (with their text/images) so
+# they can repost with a tag. Repeat offenders get timed out.
+REVIEW_ENFORCE_REP = (os.getenv("REVIEW_ENFORCE_REP", "1") or "1").lower() not in ("0", "false", "no", "")
+# Time a member out after this many tag-less posts within the window (0 = never).
+REVIEW_SPAM_TIMEOUT_AFTER = int(os.getenv("REVIEW_SPAM_TIMEOUT_AFTER", "2") or "2")
+REVIEW_SPAM_TIMEOUT_MINUTES = int(os.getenv("REVIEW_SPAM_TIMEOUT_MINUTES", "10") or "10")
+REVIEW_SPAM_WINDOW_MINUTES = int(os.getenv("REVIEW_SPAM_WINDOW_MINUTES", "60") or "60")
 # Terms of Service channel — linked again at card checkout.
 TOS_CHANNEL_ID = int(os.getenv("TOS_CHANNEL_ID", "1485235773606199326") or "0")
 
@@ -5971,11 +5979,109 @@ async def _reply_negative_review(message: discord.Message) -> None:
         print("Negative-review reply send failed:", e)
 
 
+async def _grant_customer_role_and_close(guild: discord.Guild, member: discord.Member) -> None:
+    """Give the customer role (skip staff) and auto-close their open ticket(s)."""
+    if CUSTOMER_ROLE_ID and not is_staff(member):
+        role = guild.get_role(CUSTOMER_ROLE_ID)
+        if role and role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Left a review")
+            except Exception as e:
+                print("Customer role grant failed:", e)
+    rows = await db_fetch(
+        "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND status='open'",
+        guild.id, member.id)
+    for r in rows:
+        ch = guild.get_channel(int(r["channel_id"]))
+        if isinstance(ch, discord.TextChannel):
+            try:
+                await ch.send("🌟 Thanks for your review! Closing this ticket now.")
+                await close_ticket_flow(
+                    ch, closed_by=f"Auto-close (review by {member})",
+                    reason="Customer left a review ✅")
+            except Exception as e:
+                print("Review auto-close failed:", e)
+
+
+# Recent tag-less posts per author (in-memory), for the timeout escalation.
+_rep_spam_hits: dict[int, list[datetime]] = {}
+
+
+async def bounce_non_rep_post(message: discord.Message) -> None:
+    """A post in the reviews channel with no +rep/-rep tag isn't a trackable review
+    and just clutters the channel. Save the author's text + images, delete the post,
+    and DM it back so they can repost it WITH a tag. Repeat offenders get timed out."""
+    guild = message.guild
+    member = message.author
+    if guild is None or not isinstance(member, discord.Member):
+        return
+    text = (message.content or "").strip()
+    # Grab their attachments first (so we can hand them back) — the message is
+    # about to be deleted.
+    saved: list[discord.File] = []
+    for a in message.attachments[:5]:
+        try:
+            data = await _fetch_bytes(a.url)
+            if data:
+                saved.append(discord.File(io.BytesIO(data), filename=a.filename))
+        except Exception:
+            pass
+    try:
+        await message.delete()
+    except Exception as e:
+        print("Could not delete tag-less review post:", e)
+
+    # Escalate to a timeout if they keep doing it within the window.
+    timed_out = False
+    if REVIEW_SPAM_TIMEOUT_AFTER > 0 and not is_staff(member):
+        now = utcnow()
+        window = timedelta(minutes=REVIEW_SPAM_WINDOW_MINUTES)
+        hits = [t for t in _rep_spam_hits.get(member.id, []) if now - t < window]
+        hits.append(now)
+        if len(hits) >= REVIEW_SPAM_TIMEOUT_AFTER:
+            try:
+                await member.timeout(
+                    timedelta(minutes=REVIEW_SPAM_TIMEOUT_MINUTES),
+                    reason="Repeatedly posting in the reviews channel without a +rep/-rep")
+                timed_out = True
+                hits = []  # reset after acting
+            except Exception as e:
+                print("Review spam timeout failed:", e)
+        _rep_spam_hits[member.id] = hits
+
+    reps = f"<#{REPS_CHANNEL_ID}>" if REPS_CHANNEL_ID else "the reviews channel"
+    ready = (text or "<your review>")[:900]
+    desc = (
+        f"Every post in {reps} needs a **+rep** (or **-rep**) tag so we can track it — "
+        f"yours didn't have one, so I removed it to keep the channel tidy. Nothing's lost — "
+        f"here's your message back. 👇\n\n"
+        f"**Just repost it with the tag**, like this:\n```\n+rep ⭐⭐⭐⭐⭐\n{ready}\n```"
+    )
+    if saved:
+        desc += "\n📸 Your image(s) are attached — re-upload them with your review."
+    if timed_out:
+        desc += (f"\n\n⏳ You've been timed out for **{REVIEW_SPAM_TIMEOUT_MINUTES} min** for "
+                 f"repeated posts without a tag. You can post your review once it lifts.")
+    embed = discord.Embed(title="⭐ Please add +rep or -rep", description=desc, color=AF_BLUE)
+    try:
+        await member.send(embed=embed, files=saved)
+    except Exception:
+        # DM closed → brief self-deleting note in the channel.
+        try:
+            await message.channel.send(
+                f"{member.mention} Please include a **+rep** or **-rep** in your review so we "
+                f"can track it — your post was removed. Repost it with the tag. 🙏",
+                delete_after=30)
+        except Exception:
+            pass
+
+
 async def handle_review_post(message: discord.Message) -> None:
     """Handle a post in the reviews/reps channel.
     -rep → read it and reply offering compensation (keep the ticket OPEN).
-    otherwise (a +rep or plain review) → ❤️ react (on +rep), grant the customer
-    role, and auto-close the customer's open ticket(s)."""
+    +rep → ❤️ react, count the vouch, grant the customer role, auto-close ticket(s).
+    Any post without a +rep/-rep tag is removed and DM'd back so the author can
+    repost it with a tag (unless REVIEW_ENFORCE_REP is off)."""
     guild = message.guild
     member = message.author
     if guild is None or not isinstance(member, discord.Member):
@@ -6013,7 +6119,7 @@ async def handle_review_post(message: discord.Message) -> None:
         await _reply_negative_review(message)
         return
 
-    # Positive review → heart it and give it its number.
+    # Positive review → heart it, count the vouch, grant role, close their tickets.
     if is_plus:
         try:
             await message.add_reaction("❤️")
@@ -6028,30 +6134,18 @@ async def handle_review_post(message: discord.Message) -> None:
                     mention_author=False)
             except Exception as e:
                 print("Vouch count reply failed:", e)
+        await _grant_customer_role_and_close(guild, member)
+        return
 
-    # Grant the customer role (skip staff — they don't need it).
-    if CUSTOMER_ROLE_ID and not is_staff(member):
-        role = guild.get_role(CUSTOMER_ROLE_ID)
-        if role and role not in member.roles:
-            try:
-                await member.add_roles(role, reason="Left a review")
-            except Exception as e:
-                print("Customer role grant failed:", e)
-
-    # Auto-close their open tickets (thanks them + saves/DMs the transcript).
-    rows = await db_fetch(
-        "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND status='open'",
-        guild.id, member.id)
-    for r in rows:
-        ch = guild.get_channel(int(r["channel_id"]))
-        if isinstance(ch, discord.TextChannel):
-            try:
-                await ch.send("🌟 Thanks for your review! Closing this ticket now.")
-                await close_ticket_flow(
-                    ch, closed_by=f"Auto-close (review by {member})",
-                    reason="Customer left a review ✅")
-            except Exception as e:
-                print("Review auto-close failed:", e)
+    # Neither +rep nor -rep. Staff can chat freely here; a customer's tag-less post
+    # is bounced back so they repost it with a tag (keeps the channel spam-free and
+    # every review trackable). With enforcement off, keep the old lenient behaviour.
+    if not REVIEW_ENFORCE_REP:
+        await _grant_customer_role_and_close(guild, member)
+        return
+    if is_staff(member):
+        return
+    await bounce_non_rep_post(message)
 
 
 async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason: str):
