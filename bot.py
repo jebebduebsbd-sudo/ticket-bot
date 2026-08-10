@@ -1283,16 +1283,115 @@ class ViewSkinsButton(discord.ui.DynamicItem[discord.ui.Button],
         await interaction.followup.send(embed=pager.render(), view=pager, ephemeral=True)
 
 
+# ============================================================
+# SKIN CHECKER — "does this account have X?"
+# People constantly ask for one specific skin, so every account card gets a
+# 🔎 button (and /check_skins) that answers with an exact ✅/❌ per item,
+# using the same alias matching as search (FNCS pickaxe → Axe of Champions).
+# ============================================================
+def _matched_cosmetics(owned: list[str], term: str) -> list[str]:
+    """Owned cosmetic/game names matching a requested term (alias-aware)."""
+    cands = _expand_skin_query(term)
+    hits = [n for n in owned if any(c in n.lower() for c in cands)]
+    return _dedup_keep_order(hits)
+
+
+async def check_account_items(item_id: str | int, terms: list[str]) -> dict:
+    """Check one account for each requested skin/item/game.
+    Returns {ok, title, game, results: [(term, [matched names])], error}."""
+    det = await lzt_item_detail(item_id)
+    if not det["ok"]:
+        return {"ok": False, "title": None, "game": None, "results": [], "error": det["error"]}
+    item = det["item"] or {}
+    cid = (item.get("category") or {}).get("category_id") or item.get("category_id")
+    game = "valorant" if cid == 13 else "fortnite" if cid == 9 else "steam" if cid == 1 else "generic"
+    names = await _searchable_names(game, item)
+    results = [(t, _matched_cosmetics(names, t)) for t in terms]
+    return {"ok": True, "title": item.get("title") or item.get("title_en") or "Account",
+            "game": game, "results": results, "error": None}
+
+
+def skin_check_embed(item_id: str | int, title: str,
+                     results: list[tuple[str, list[str]]]) -> discord.Embed:
+    iid = re.sub(r"[^0-9]", "", str(item_id))
+    found = sum(1 for _, m in results if m)
+    e = discord.Embed(
+        title="🔎  Skin Check",
+        description=(f"**Account:** `{iid}` — {str(title)[:120]}\n"
+                     f"**Found {found} of {len(results)}** requested item(s)."),
+        color=0x2ECC71 if found == len(results) else (AF_BLUE if found else 0xE74C3C),
+    )
+    for term, matches in results[:10]:
+        if matches:
+            shown = ", ".join(m[:60] for m in matches[:6])
+            if len(matches) > 6:
+                shown += f" …and {len(matches) - 6} more"
+            e.add_field(name=f"✅ {term[:100]}", value=shown[:1024], inline=False)
+        else:
+            e.add_field(name=f"❌ {term[:100]}", value="Not found on this account.", inline=False)
+    e.set_footer(text="AF SERVICES • Skin check")
+    return e
+
+
+class SkinCheckModal(discord.ui.Modal, title="Check skins on this account"):
+    skins = discord.ui.TextInput(
+        label="Skins / items to check",
+        style=discord.TextStyle.long,
+        required=True,
+        max_length=400,
+        placeholder="One per line or comma-separated — e.g. Reaver Vandal, Prime Phantom",
+    )
+
+    def __init__(self, item_id: int):
+        super().__init__()
+        self.item_id = item_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        terms = _split_list(str(self.skins.value))[:10]
+        if not terms:
+            await interaction.followup.send("Type at least one skin/item name to check.",
+                                            ephemeral=True)
+            return
+        res = await check_account_items(self.item_id, terms)
+        if not res["ok"]:
+            await interaction.followup.send(
+                f"⚠️ Couldn't check this account: `{res['error']}`", ephemeral=True)
+            return
+        await interaction.followup.send(
+            embed=skin_check_embed(self.item_id, res["title"], res["results"]), ephemeral=True)
+
+
+class CheckSkinsButton(discord.ui.DynamicItem[discord.ui.Button],
+                       template=r"af_skincheck:(?P<item_id>\d+)"):
+    """Persistent button on account embeds: ask 'does it have X?' → ✅/❌ per item."""
+    def __init__(self, item_id: int, label: str = "🔎 Check skins"):
+        self.item_id = int(item_id)
+        super().__init__(discord.ui.Button(
+            label=label, style=discord.ButtonStyle.secondary,
+            custom_id=f"af_skincheck:{item_id}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["item_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(SkinCheckModal(self.item_id))
+
+
 def skins_view_for(items: list[dict], category: str) -> discord.ui.View | None:
-    """A View with one 'View all skins' button per account (max 5)."""
+    """A View with 'View all skins' + 'Check skins' buttons per account (max 5 accounts)."""
     view = discord.ui.View(timeout=None)
     added = 0
     for i, it in enumerate(items):
         iid = _account_item_id(it)
         if not iid:
             continue
-        label = "🎨 View all skins" if len(items) == 1 else f"🎨 Skins #{i + 1}"
-        view.add_item(ViewSkinsButton(int(iid), category.lower(), label=label))
+        one = len(items) == 1
+        view.add_item(ViewSkinsButton(int(iid), category.lower(),
+                                      label="🎨 View all skins" if one else f"🎨 Skins #{i + 1}"))
+        view.add_item(CheckSkinsButton(int(iid),
+                                       label="🔎 Check skins" if one else f"🔎 Check #{i + 1}"))
         added += 1
         if added >= 5:
             break
@@ -3780,6 +3879,23 @@ async def account_info_command(interaction: discord.Interaction, item_id: str):
     await interaction.followup.send(**kwargs)
 
 
+@bot.tree.command(name="check_skins",
+                  description="Check if an account has specific skins / items / games.")
+@app_commands.describe(item_id="Account listing/item ID",
+                       skins="What to check for, comma-separated (e.g. reaver vandal, prime)")
+async def check_skins_command(interaction: discord.Interaction, item_id: str, skins: str):
+    await interaction.response.defer()
+    terms = _split_list(skins)[:10]
+    if not terms:
+        await interaction.followup.send("Give me at least one skin/item to check.", ephemeral=True)
+        return
+    res = await check_account_items(item_id, terms)
+    if not res["ok"]:
+        await interaction.followup.send(f"⚠️ Stock error: `{res['error']}`", ephemeral=True)
+        return
+    await interaction.followup.send(embed=skin_check_embed(item_id, res["title"], res["results"]))
+
+
 @bot.tree.command(name="reserve",
                   description="Reserve an account for this ticket — auto-alerts you to buy it once paid.")
 @staff_only()
@@ -5200,6 +5316,9 @@ def _build_ai_shop_prompt() -> str:
         "automatically shows the CHEAPEST account that does have them and labels it as over "
         "budget. So still run the search (action \"search\") even when the budget seems too low "
         "for the item — never refuse outright; the customer decides if they'll stretch.\n"
+        "- If they ask whether one of the SHOWN accounts has a certain skin, NEVER answer from "
+        "memory — tell them to tap the 🔎 Check skins button under that account for an exact "
+        "yes/no (action \"none\").\n"
         "- Be warm, concise, human.\n\n"
         "Each turn, respond with ONLY a JSON object (no prose around it):\n"
         "{\n"
@@ -6222,9 +6341,10 @@ async def on_ready():
     bot.add_view(DeliveryApprovalView())
     bot.add_view(CryptoPayView())
     bot.add_view(CryptoCheckView())
-    # Resolve dynamic buttons (View all skins / Read email letters) after restarts.
+    # Resolve dynamic buttons (View all skins / Check skins / Read email letters)
+    # after restarts.
     try:
-        bot.add_dynamic_items(ViewSkinsButton, ReadMailButton)
+        bot.add_dynamic_items(ViewSkinsButton, CheckSkinsButton, ReadMailButton)
     except Exception as e:
         print("Dynamic item register failed:", e)
 
