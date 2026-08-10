@@ -428,6 +428,18 @@ CREATE TABLE IF NOT EXISTS vouches (
 );
 CREATE INDEX IF NOT EXISTS idx_vouches_guild ON vouches (guild_id);
 
+-- Reviews: one row per +rep / -rep post in the reviews channel, so we can tell
+-- whether a given customer has left a review yet (and nudge the ones who haven't).
+-- Keyed by message id; kind is 'plus' or 'minus'.
+CREATE TABLE IF NOT EXISTS reviews (
+  message_id BIGINT PRIMARY KEY,
+  guild_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  kind TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_guild_user ON reviews (guild_id, user_id);
+
 -- One-off bookkeeping flags (e.g. "the vouch history has been counted").
 CREATE TABLE IF NOT EXISTS bot_meta (
   key TEXT PRIMARY KEY,
@@ -3503,6 +3515,23 @@ async def ticket_stats(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e, ephemeral=True, files=embed_files())
 
 
+@bot.tree.command(name="vouches", description="Show the AF SERVICES vouch total (+rep count).")
+async def vouches_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use in a server.", ephemeral=True)
+        return
+    total = await vouch_total(guild.id)
+    reps = f"<#{REPS_CHANNEL_ID}>" if REPS_CHANNEL_ID else "the reviews channel"
+    e = discord.Embed(
+        title="⭐ AF SERVICES • Vouches",
+        description=(f"**{total}** verified +rep{'' if total == 1 else 's'} and counting!\n\n"
+                     f"Leave yours in {reps} 💙"),
+        color=AF_BLUE)
+    e.set_thumbnail(url=logo_ref())
+    await interaction.response.send_message(embed=e, files=embed_files())
+
+
 # ============================================================
 # STOCK / DELIVERY / VERIFICATION COMMANDS
 # ============================================================
@@ -5559,11 +5588,76 @@ async def record_vouch(message: discord.Message) -> int | None:
 
 async def uncount_vouch(message_id: int) -> None:
     """Forget a vouch whose post was deleted, so removing a fake +rep also
-    removes it from the total."""
+    removes it from the total (and from the review-tracking table)."""
     try:
         await db_execute("DELETE FROM vouches WHERE message_id=$1", message_id)
+        await db_execute("DELETE FROM reviews WHERE message_id=$1", message_id)
     except Exception as e:
         print("Vouch removal failed:", e)
+
+
+async def record_review(message: discord.Message, kind: str) -> None:
+    """Log a +rep or -rep post so we know this customer has left a review.
+    Keyed by message id, so re-processing the same post is a no-op."""
+    if message.guild is None:
+        return
+    try:
+        await db_execute(
+            "INSERT INTO reviews(message_id, guild_id, user_id, kind, created_at) "
+            "VALUES ($1,$2,$3,$4,$5) ON CONFLICT (message_id) DO NOTHING",
+            message.id, message.guild.id, message.author.id, kind, message.created_at)
+    except Exception as e:
+        print("Review record failed:", e)
+
+
+async def has_reviewed(guild_id: int, user_id: int) -> bool:
+    """True if this customer has already left a +rep or -rep in the reviews channel."""
+    row = await db_fetchrow(
+        "SELECT 1 FROM reviews WHERE guild_id=$1 AND user_id=$2 LIMIT 1",
+        guild_id, user_id)
+    return row is not None
+
+
+async def prompt_for_review(guild: discord.Guild, user_id: int) -> None:
+    """DM a customer who hasn't left a +rep/-rep yet, asking them to leave one so
+    every review gets tracked. Only sent privately (DM), skips staff and anyone
+    who already reviewed, and is rate-limited to once a day per customer so a
+    person with several closed tickets isn't spammed."""
+    if not REPS_CHANNEL_ID:
+        return
+    member = guild.get_member(user_id)
+    if member and is_staff(member):
+        return
+    if await has_reviewed(guild.id, user_id):
+        return
+    # Don't nag the same customer more than once a day (across multiple closes).
+    flag = f"rep_prompt:{guild.id}:{user_id}"
+    recent = await db_fetchrow(
+        "SELECT 1 FROM bot_meta WHERE key=$1 AND updated_at > NOW() - INTERVAL '20 hours'",
+        flag)
+    if recent:
+        return
+    reps = f"<#{REPS_CHANNEL_ID}>"
+    try:
+        user = member or await bot.fetch_user(user_id)
+        await user.send(embed=discord.Embed(
+            title="⭐  How did we do?",
+            description=(f"We noticed you haven't left a review yet! Mind dropping a quick "
+                        f"**+rep** in {reps} if you're happy — or a **-rep** if something "
+                        f"was off? It only takes a second and helps us keep track of every "
+                        f"review.\n\nReminder: **no review = no warranty**, so it's worth "
+                        f"leaving one either way. 💙"),
+            color=AF_BLUE))
+    except Exception as e:
+        print("Review prompt DM failed:", e)
+        return
+    try:
+        await db_execute(
+            "INSERT INTO bot_meta(key, value) VALUES ($1,$2) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+            flag, "1")
+    except Exception as e:
+        print("Review prompt bookkeeping failed:", e)
 
 
 _vouch_backfill_running = False
@@ -5678,6 +5772,7 @@ async def handle_review_post(message: discord.Message) -> None:
                 except Exception:
                     pass
             return
+        await record_review(message, "minus")
         await _reply_negative_review(message)
         return
 
@@ -5687,6 +5782,7 @@ async def handle_review_post(message: discord.Message) -> None:
             await message.add_reaction("❤️")
         except Exception as e:
             print("Review react failed:", e)
+        await record_review(message, "plus")
         total = await record_vouch(message)
         if total is not None:
             try:
@@ -5765,6 +5861,21 @@ async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason
             close_reason=reason,
             data=transcript_data,
         )
+
+    # If a customer we actually served never left a +rep/-rep, privately nudge
+    # them to (so every review gets tracked). Skips staff, anyone who already
+    # reviewed, review-triggered closes, and abandoned tickets nobody engaged
+    # with (never claimed and no delivery) so we don't nag non-customers.
+    try:
+        owner_id = int(row["owner_id"])
+        served = row["claimed_by"] is not None
+        if not served:
+            served = await db_fetchrow(
+                "SELECT 1 FROM deliveries WHERE owner_id=$1 LIMIT 1", owner_id) is not None
+        if served:
+            await prompt_for_review(channel.guild, owner_id)
+    except Exception as e:
+        print("Review prompt failed:", e)
 
     owner_line = (
         "📨 Transcript sent to you via DM."
@@ -6030,6 +6141,9 @@ async def review_reminder_loop():
     reps = f"<#{REPS_CHANNEL_ID}>" if REPS_CHANNEL_ID else "our reviews channel"
     for r in rows:
         await db_execute("UPDATE deliveries SET review_reminded=TRUE WHERE id=$1", r["id"])
+        # Don't nag buyers who already left a +rep/-rep.
+        if await has_reviewed(GUILD_ID, int(r["owner_id"])):
+            continue
         try:
             user = await bot.fetch_user(int(r["owner_id"]))
             await user.send(embed=discord.Embed(
