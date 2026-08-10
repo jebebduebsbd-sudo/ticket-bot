@@ -195,6 +195,22 @@ def game_label(key: str) -> str:
     return LZT_GAME_LABELS.get((key or "").lower(), (key or "Account").title())
 # Resale markup: we sell to the customer at >= this multiple of the LZT source price.
 RESALE_MULTIPLIER = float(os.getenv("RESALE_MULTIPLIER", "2.5") or "2.5")
+# How many marketplace pages to scan when ranking accounts by "best value for the
+# budget", so cheaper-but-more-stacked listings on later pages still get considered.
+MARKET_RANK_PAGES = int(os.getenv("MARKET_RANK_PAGES", "3") or "3")
+# High budgets can afford a bigger markup: we buy relatively cheaper (deeper under
+# the budget) and keep more margin, while still ranking best-value within the cap.
+HIGH_BUDGET_EUR = float(os.getenv("HIGH_BUDGET_EUR", "30") or "30")
+HIGH_BUDGET_MULTIPLIER = float(os.getenv("HIGH_BUDGET_MULTIPLIER", "3") or "3")
+
+
+def _sourcing_markup(budget: float | None) -> float:
+    """Markup used to cap the source price under the customer's budget. Budgets at or
+    above HIGH_BUDGET_EUR use the bigger high-budget markup; everything else uses the
+    normal resale markup."""
+    if budget and budget >= HIGH_BUDGET_EUR:
+        return HIGH_BUDGET_MULTIPLIER
+    return RESALE_MULTIPLIER
 # Where "buy this now to restock" alerts go. If unset, the alert DMs the staff who triggered it.
 RESTOCK_CHANNEL_ID = int(os.getenv("RESTOCK_CHANNEL_ID", "0") or "0")
 
@@ -709,19 +725,41 @@ async def lzt_search_market(category: str, budget: float | None = None,
     # gets the cheapest account that matches; otherwise pull the richest first.
     params: dict = {"order_by": "price_to_up" if cheapest else "price_to_down"}
     if budget and budget > 0:
-        # The source price must be ~2.5x under the customer's budget so we buy cheap
-        # and resell at roughly their budget. (pmax is the LZT source-price ceiling.)
-        params["pmax"] = round(budget / RESALE_MULTIPLIER, 2)
-    res = await _lzt_get(f"/{slug}", params)
-    if not res["ok"]:
-        out["error"] = res["error"]
-        return out
-    items = (res["data"] or {}).get("items") or []
+        # The source price is capped at budget / markup so we buy cheap and stay within
+        # the customer's budget. High budgets use a bigger markup. (pmax = price ceiling.)
+        params["pmax"] = round(budget / _sourcing_markup(budget), 2)
+    # When ranking by "most stacked" we scan several pages, not just the most
+    # expensive one: a cheaper account often carries MORE skins than a pricier one,
+    # and grabbing only page 1 (priciest-first) hid those better-value listings.
+    # Cheapest-first (a specific request) already surfaces the right ones on page 1.
+    pages = 1 if cheapest else MARKET_RANK_PAGES
+    items: list[dict] = []
+    seen: set = set()
+    for p in range(1, pages + 1):
+        pp = dict(params)
+        if p > 1:
+            pp["page"] = p
+        res = await _lzt_get(f"/{slug}", pp)
+        if not res["ok"]:
+            if p == 1:
+                out["error"] = res["error"]
+                return out
+            break  # keep whatever earlier pages returned
+        batch = (res["data"] or {}).get("items") or []
+        if not batch:
+            break
+        for it in batch:
+            iid = it.get("item_id") or it.get("id")
+            if iid in seen:
+                continue
+            seen.add(iid)
+            items.append(it)
     if cheapest:
         # Cheapest matching account first (within budget).
         items.sort(key=lambda it: float(it.get("price") or 1e9))
     else:
-        # Richest first — most invested in the account for the budget.
+        # Best value for the budget: most stacked first (Fortnite → most skins +
+        # V-Bucks spent; Valorant → skin/VP value), not merely the most expensive.
         items.sort(key=lambda it: _spent_metric(category, it), reverse=True)
     limit = pool if pool else max(1, min(count, 5))
     out.update(ok=True, items=items[:max(1, limit)])
@@ -3569,6 +3607,78 @@ async def review_guide_cmd(interaction: discord.Interaction):
         f"✅ Posted and pinned the review guide in {channel.mention}.", ephemeral=True)
 
 
+@bot.tree.command(name="claim", description="Claim the current ticket (assign it to yourself).")
+@staff_only()
+async def claim_command(interaction: discord.Interaction):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+    row = await db_fetchrow(
+        "SELECT claimed_by, status FROM tickets WHERE channel_id=$1", channel.id)
+    if not row or row["status"] != "open":
+        await interaction.response.send_message("This isn't an open ticket.", ephemeral=True)
+        return
+    if row["claimed_by"] is not None:
+        claimer = interaction.guild.get_member(int(row["claimed_by"])) if interaction.guild else None
+        who = claimer.mention if claimer else f"<@{int(row['claimed_by'])}>"
+        await interaction.response.send_message(
+            f"This ticket is already claimed by {who}.", ephemeral=True)
+        return
+    await db_execute(
+        "UPDATE tickets SET claimed_by=$1, last_activity=NOW() WHERE channel_id=$2",
+        interaction.user.id, channel.id)
+    try:
+        await hide_ticket_from_other_staff(channel, interaction.user)
+    except Exception as e:
+        print("Claim permission update failed:", e)
+    await interaction.response.send_message("✅ Ticket claimed.", ephemeral=True)
+    try:
+        await channel.send(f"✅ Ticket claimed by {interaction.user.mention}.")
+        await refresh_ticket_control_message(channel)
+    except Exception as e:
+        print("Claim announce failed:", e)
+
+
+@bot.tree.command(name="setprice",
+                  description="Set the customer's price (custom) and post their checkout.")
+@staff_only()
+@app_commands.describe(amount="Account price in EUR (card adds its fee automatically)")
+async def setprice_command(interaction: discord.Interaction, amount: float):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("Enter a price greater than 0.", ephemeral=True)
+        return
+    row = await db_fetchrow(
+        "SELECT checkout_method FROM tickets WHERE channel_id=$1", channel.id)
+    if not row:
+        await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
+        return
+    method = (row["checkout_method"] or "").lower()
+    await interaction.response.defer(ephemeral=True)
+    if method == "crypto":
+        await post_crypto_checkout(channel, amount)
+        await interaction.followup.send(
+            f"✅ Posted the crypto checkout for €{amount:.2f}.", ephemeral=True)
+    elif method == "card":
+        await post_card_checkout(channel, amount)
+        await interaction.followup.send(
+            f"✅ Posted the card checkout (account €{amount:.2f} + card fee).", ephemeral=True)
+    else:
+        # No payment method chosen yet → store the price and ask how they'll pay.
+        await db_execute(
+            "UPDATE tickets SET checkout_total=$1 WHERE channel_id=$2", amount, channel.id)
+        await channel.send(
+            f"💶 Your price is set to **€{amount:.2f}**. Would you like to pay by "
+            f"**crypto** or **card**?")
+        await interaction.followup.send(
+            f"✅ Price set to €{amount:.2f} — waiting on the customer's payment method.",
+            ephemeral=True)
+
+
 # ============================================================
 # STOCK / DELIVERY / VERIFICATION COMMANDS
 # ============================================================
@@ -3762,7 +3872,8 @@ async def market_command(interaction: discord.Interaction, category: app_command
 
     embeds, files = [], []
     for i, item in enumerate(chosen):
-        embed, file = await build_account_message(category.value, item, i)
+        # No price shown — the owner sets custom prices; cost stays in the background.
+        embed, file = await build_account_message(category.value, item, i, show_price=False)
         embeds.append(embed)
         if file:
             files.append(file)
@@ -5081,6 +5192,25 @@ async def post_card_checkout(channel: discord.TextChannel, account_price: float)
     await channel.send(embed=e)
 
 
+async def notify_staff_set_price(channel: discord.TextChannel, method: str) -> None:
+    """Ping the handler (the claimer, or the staff role) to set a custom price with
+    /setprice, which then posts the customer's checkout."""
+    who = None
+    row = await db_fetchrow("SELECT claimed_by FROM tickets WHERE channel_id=$1", channel.id)
+    if row and row["claimed_by"]:
+        who = f"<@{int(row['claimed_by'])}>"
+    elif STAFF_ROLE_ID:
+        who = f"<@&{STAFF_ROLE_ID}>"
+    prefix = f"{who} " if who else ""
+    try:
+        await channel.send(
+            f"{prefix}⚙️ Customer chose **{method}** — set their price with "
+            f"`/setprice <amount>` to post the checkout.",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=True))
+    except Exception as e:
+        print("Set-price nudge failed:", e)
+
+
 MARKET_SCAN_DEEP = 40  # how many listings to inspect when filtering a specific request
 
 
@@ -5155,7 +5285,10 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
 
     embeds, files, offers = [], [], []
     for i, item in enumerate(chosen):
-        embed, file = await build_account_message(game, item, i)
+        # No price shown to the customer — every account here already fits their
+        # budget, and the owner sets the final (custom) price. The cost is still
+        # computed in the background (stored in `offers` below) for checkout/sourcing.
+        embed, file = await build_account_message(game, item, i, show_price=False)
         embed.title = f"#{i + 1} • {embed.title}"  # number for easy selection
         embeds.append(embed)
         if file:
@@ -5169,14 +5302,15 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
     view = skins_view_for(chosen, game) if game in ("valorant", "fortnite") else None
     if partial:
         lead = ("I couldn't find one account with **everything** you asked for within budget, so "
-                "here are the **closest matches** (cheapest first) 👇")
+                "here are the **closest matches** 👇")
     elif specific:
-        lead = "Here are the cheapest matches 👇"
+        lead = "Here are the best matches 👇"
     else:
         lead = "Here are the best matches 👇"
     kwargs = {
-        "content": f"{lead} Reply with the **number** of the one you want, "
-                   "or ask me to adjust the budget.",
+        "content": f"{lead} These all fit **within your budget**. Reply with the "
+                   "**number** of the one you want and how you'd like to pay, or ask "
+                   "me to adjust the budget.",
         "embeds": embeds[:10], "files": files,
     }
     if view is not None:
@@ -5205,8 +5339,10 @@ def _build_ai_shop_prompt() -> str:
         "- NEVER invent account details, skins, or prices. The system shows real accounts.\n"
         "- NEVER reveal or promise account logins/credentials — the OWNER always delivers those "
         "after payment. You only take the order up to payment/proof.\n"
-        "- Card payments include a surcharge; the system computes the exact total — don't quote a "
-        "card total yourself, just say card has a small fee and let the system post it.\n"
+        "- Prices are CUSTOM — the OWNER sets each price. NEVER quote, estimate, or promise any "
+        "price or total to the customer. Just reassure them the account fits their budget and the "
+        "owner will confirm the exact price. Card adds a small fee, applied automatically once the "
+        "price is set. The system posts all payment details — never post a number yourself.\n"
         "- 'skins' is for the specific things they want: Valorant/Fortnite cosmetics, OR Steam "
         "game titles (e.g. 'GTA V', 'CS2'). Put each requested item in the skins array.\n"
         "- When the customer names a cosmetic by a community NICKNAME, translate it to the "
@@ -5237,7 +5373,8 @@ def _build_ai_shop_prompt() -> str:
         "2. Have game + budget → action \"search\" (reply: tell them you're pulling options).\n"
         "3. They pick one (e.g. 'the 2nd', '#1') → action \"select\" with index (reply: confirm the "
         "pick, ask whether they want to pay by crypto or card).\n"
-        "4. They choose a method → action \"checkout\" with method (reply: tell them the checkout is below).\n"
+        "4. They choose a method → action \"checkout\" with method (reply: tell them the owner will "
+        "confirm the exact price and their payment details will appear here shortly — do NOT state a price).\n"
         "CRITICAL: Always use the customer's MOST RECENT budget and game. If they change the budget "
         "or game at ANY point — even after you've already shown options or they picked one (e.g. they "
         "first said €1.3 then say €20, or switch from Valorant to Steam) — treat it as a brand-new "
@@ -5321,21 +5458,31 @@ async def run_ai_shopping(channel: discord.TextChannel, owner: discord.abc.User)
     elif action == "checkout":
         method = str(data.get("method") or "").lower()
         row = await db_fetchrow(
-            "SELECT reserved_market_item_id FROM tickets WHERE channel_id=$1", channel.id)
+            "SELECT reserved_market_item_id, checkout_total FROM tickets WHERE channel_id=$1",
+            channel.id)
         if not row or not row["reserved_market_item_id"]:
             await channel.send("First let me know which account you'd like, then we'll set up payment.")
             return
-        det = await lzt_item_detail(row["reserved_market_item_id"])
-        if not det["ok"]:
-            await channel.send("Hmm, I couldn't load that account just now — a staff member will help.")
-            return
-        _, price = _resale_price(det["item"] or {})
-        if method == "crypto":
-            await post_crypto_checkout(channel, price)
-        elif method == "card":
-            await post_card_checkout(channel, price)
-        else:
+        if method not in ("crypto", "card"):
             await channel.send("Would you like to pay by **crypto** or **card**?")
+            return
+        # Prices are custom — the owner sets them. Record the chosen method; if the
+        # owner already set a price, post the checkout now, otherwise wait for /setprice.
+        await db_execute(
+            "UPDATE tickets SET checkout_method=$1, last_activity=NOW() WHERE channel_id=$2",
+            method, channel.id)
+        preset = row["checkout_total"]
+        if preset is not None:
+            price = float(preset)
+            if method == "crypto":
+                await post_crypto_checkout(channel, price)
+            else:
+                await post_card_checkout(channel, price)
+        else:
+            await channel.send(
+                f"Got it — **{method}** payment. 🧾 The owner will confirm your exact price in a "
+                f"moment, then I'll post your payment details right here. One sec! 🙏")
+            await notify_staff_set_price(channel, method)
 
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
