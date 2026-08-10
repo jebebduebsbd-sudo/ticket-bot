@@ -3532,6 +3532,43 @@ async def vouches_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e, files=embed_files())
 
 
+@bot.tree.command(name="review_guide",
+                  description="Post & pin the 'how to leave a review' format guide in the reviews channel.")
+@staff_only()
+async def review_guide_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use in a server.", ephemeral=True)
+        return
+    channel = await resolve_text_channel(guild, REPS_CHANNEL_ID) if REPS_CHANNEL_ID else None
+    if channel is None:
+        await interaction.response.send_message(
+            "⚠️ No reviews channel is configured (set `REPS_CHANNEL_ID`) or I can't see it.",
+            ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    # Replace a guide we posted before, so the channel never collects duplicates.
+    flag = f"review_guide_msg:{guild.id}"
+    prev = await db_fetchrow("SELECT value FROM bot_meta WHERE key=$1", flag)
+    if prev and prev["value"]:
+        try:
+            old = await channel.fetch_message(int(prev["value"]))
+            await old.delete()
+        except Exception:
+            pass
+    msg = await channel.send(embed=make_review_format_embed(), files=embed_files())
+    try:
+        await msg.pin()
+    except Exception as e:
+        print("Review guide pin failed:", e)
+    await db_execute(
+        "INSERT INTO bot_meta(key, value) VALUES ($1,$2) "
+        "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+        flag, str(msg.id))
+    await interaction.followup.send(
+        f"✅ Posted and pinned the review guide in {channel.mention}.", ephemeral=True)
+
+
 # ============================================================
 # STOCK / DELIVERY / VERIFICATION COMMANDS
 # ============================================================
@@ -4262,6 +4299,38 @@ def detect_game(*texts: str | None) -> str | None:
     return None
 
 
+# The exact review format we ask customers to copy — kept in one place so the
+# in-ticket prompt and the pinned reviews-channel guide always match.
+REVIEW_TEMPLATE = (
+    "+rep ⭐⭐⭐⭐⭐\n"
+    "Bought: <what you bought — e.g. Fortnite OG account>\n"
+    "Experience: <how it went — fast delivery, great support...>\n"
+    "📸 (attach a screenshot!)"
+)
+
+
+def make_review_format_embed() -> discord.Embed:
+    """The 'how to leave your review' card: the copy-paste format + a nudge to
+    attach a screenshot, used both in the ticket and pinned in the reviews channel."""
+    e = discord.Embed(
+        title="⭐  How to leave your review",
+        description=(
+            "It takes 10 seconds and keeps your **warranty valid** — just copy this "
+            "format:\n\n"
+            f"```\n{REVIEW_TEMPLATE}\n```\n"
+            "📸 **Please attach a screenshot** (your account, skins, the order — anything) "
+            "so your review really stands out for the next buyer!\n\n"
+            "Happy with everything? Drop a **+rep**. Something off? Leave a **-rep** and "
+            "we'll make it right."
+        ),
+        color=AF_BLUE,
+    )
+    e.set_author(name="AF SERVICES • Reviews")
+    e.set_thumbnail(url=logo_ref())
+    e.set_footer(text="No review = no warranty • Thank you for your support! 💙")
+    return e
+
+
 async def post_purchase_followup(channel: discord.TextChannel, owner: discord.abc.User,
                                  product: str | None, title: str | None) -> None:
     """After a confirmed delivery, send the matching security guide + replacement policy."""
@@ -4284,6 +4353,27 @@ async def post_purchase_followup(channel: discord.TextChannel, owner: discord.ab
         view=view,
         files=embed_files(),
     )
+
+    # While the ticket's still fresh, show the buyer exactly how to leave a review
+    # (with a screenshot) and a one-tap jump to the reviews channel.
+    if REPS_CHANNEL_ID:
+        rv = discord.ui.View(timeout=None)
+        rv.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link,
+            label="Go to reviews",
+            emoji="⭐",
+            url=f"https://discord.com/channels/{channel.guild.id}/{REPS_CHANNEL_ID}"))
+        try:
+            await channel.send(
+                content=(f"{owner.mention} ⭐ **Enjoying your purchase?** Please leave us a quick "
+                         f"review in <#{REPS_CHANNEL_ID}> using the format below — a screenshot "
+                         f"helps a ton! 💙"),
+                embed=make_review_format_embed(),
+                view=rv,
+                files=embed_files(),
+            )
+        except Exception as e:
+            print("In-ticket review prompt failed:", e)
 
 
 def make_epic_guide_embed() -> discord.Embed:
