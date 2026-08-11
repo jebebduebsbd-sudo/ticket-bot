@@ -6035,6 +6035,32 @@ async def _reply_negative_review(message: discord.Message) -> None:
         print("Negative-review reply send failed:", e)
 
 
+async def alert_staff_negative_review(message: discord.Message) -> None:
+    """Ping staff in the log channel the moment a -rep lands, so someone can jump on
+    the unhappy customer fast (this is where refunds/retention are won)."""
+    guild = message.guild
+    if guild is None:
+        return
+    log_ch = await get_log_channel(guild)
+    if log_ch is None:
+        return
+    member = message.author
+    text = (message.content or "").strip() or "*(no text)*"
+    who = f"<@&{OWNER_ROLE_ID}>" if OWNER_ROLE_ID else (f"<@&{STAFF_ROLE_ID}>" if STAFF_ROLE_ID else "")
+    e = discord.Embed(
+        title="⚠️ Negative review (-rep) just posted",
+        description=(f"**Customer:** {member.mention} (`{member.id}`)\n"
+                     f"**Review:** {text[:1500]}\n\n"
+                     f"[Jump to the post]({message.jump_url})"),
+        color=0xE74C3C)
+    e.set_footer(text="Reach out fast — offer a fix/compensation to turn it around.")
+    try:
+        await log_ch.send(content=who or None, embed=e,
+                          allowed_mentions=discord.AllowedMentions(roles=True))
+    except Exception as e2:
+        print("Negative-review staff alert failed:", e2)
+
+
 async def _grant_customer_role_and_close(guild: discord.Guild, member: discord.Member) -> None:
     """Give the customer role (skip staff) and auto-close their open ticket(s)."""
     if CUSTOMER_ROLE_ID and not is_staff(member):
@@ -6173,6 +6199,7 @@ async def handle_review_post(message: discord.Message) -> None:
             return
         await record_review(message, "minus")
         await _reply_negative_review(message)
+        await alert_staff_negative_review(message)
         return
 
     # Positive review → heart it, count the vouch, grant role, close their tickets.
