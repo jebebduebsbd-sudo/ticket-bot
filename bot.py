@@ -391,6 +391,8 @@ ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_handled BOOLEAN NOT NULL DEFAULT
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS verified_order_id TEXT NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS verified_product TEXT NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reserved_market_item_id BIGINT NULL;
+-- Last budget the customer searched with, so /setprice can show it as a pricing aid.
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_budget NUMERIC NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS restock_alerted BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_payment_id TEXT NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_amount NUMERIC NULL;
@@ -3651,19 +3653,29 @@ async def claim_command(interaction: discord.Interaction):
 @bot.tree.command(name="setprice",
                   description="Set the customer's price (custom) and post their checkout.")
 @staff_only()
-@app_commands.describe(amount="Account price in EUR (card adds its fee automatically)")
-async def setprice_command(interaction: discord.Interaction, amount: float):
+@app_commands.describe(amount="Account price in EUR (leave empty to see cost/budget first)")
+async def setprice_command(interaction: discord.Interaction, amount: float | None = None):
     channel = interaction.channel
     if not isinstance(channel, discord.TextChannel):
         await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.response.send_message("Enter a price greater than 0.", ephemeral=True)
         return
     row = await db_fetchrow(
         "SELECT checkout_method FROM tickets WHERE channel_id=$1", channel.id)
     if not row:
         await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
+        return
+    # No amount → just show the staff-only pricing aid (cost, budget, suggested).
+    if amount is None:
+        aid = await pricing_aid_embed(channel)
+        if aid is None:
+            await interaction.response.send_message(
+                "No account is reserved in this ticket yet, so there's nothing to price. "
+                "Reserve one first, then run `/setprice <amount>`.", ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=aid, ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("Enter a price greater than 0.", ephemeral=True)
         return
     method = (row["checkout_method"] or "").lower()
     await interaction.response.defer(ephemeral=True)
@@ -5200,9 +5212,36 @@ async def post_card_checkout(channel: discord.TextChannel, account_price: float)
     await channel.send(embed=e)
 
 
+async def pricing_aid_embed(channel: discord.TextChannel) -> discord.Embed | None:
+    """A staff-only card showing what the reserved account costs us, the customer's
+    budget, and a suggested price — so custom pricing is an informed two-second call."""
+    row = await db_fetchrow(
+        "SELECT reserved_market_item_id, last_budget FROM tickets WHERE channel_id=$1",
+        channel.id)
+    if not row or not row["reserved_market_item_id"]:
+        return None
+    det = await lzt_item_detail(row["reserved_market_item_id"])
+    if not det["ok"]:
+        return None
+    src, resale = _resale_price(det["item"] or {})
+    budget = float(row["last_budget"]) if row["last_budget"] is not None else None
+    title = (det["item"] or {}).get("title") or "Account"
+    suggested = budget if budget else resale
+    lines = [f"**Your cost:** €{src:.2f}"]
+    if budget:
+        lines.append(f"**Customer budget:** €{budget:.0f}")
+    lines.append(f"**Suggested:** €{suggested:.0f}  ·  run `/setprice {suggested:.0f}`")
+    e = discord.Embed(
+        title="💰 Pricing aid",
+        description=f"**{str(title)[:120]}**\n\n" + "\n".join(lines),
+        color=AF_BLUE)
+    e.set_footer(text="Staff only — the customer never sees this.")
+    return e
+
+
 async def notify_staff_set_price(channel: discord.TextChannel, method: str) -> None:
     """Ping the handler (the claimer, or the staff role) to set a custom price with
-    /setprice, which then posts the customer's checkout."""
+    /setprice, and drop a staff-only pricing aid (cost/budget/suggested) in the log."""
     who = None
     row = await db_fetchrow("SELECT claimed_by FROM tickets WHERE channel_id=$1", channel.id)
     if row and row["claimed_by"]:
@@ -5217,6 +5256,16 @@ async def notify_staff_set_price(channel: discord.TextChannel, method: str) -> N
             allowed_mentions=discord.AllowedMentions(roles=True, users=True))
     except Exception as e:
         print("Set-price nudge failed:", e)
+    # Cost/budget/suggested go to the staff log (never the ticket the customer sees).
+    try:
+        aid = await pricing_aid_embed(channel)
+        if aid is not None:
+            log_ch = await get_log_channel(channel.guild)
+            if log_ch is not None:
+                aid.add_field(name="Ticket", value=channel.mention, inline=False)
+                await log_ch.send(embed=aid)
+    except Exception as e:
+        print("Pricing aid post failed:", e)
 
 
 MARKET_SCAN_DEEP = 40  # how many listings to inspect when filtering a specific request
@@ -5272,6 +5321,13 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
     # a deep pool so there are enough EU listings to choose from.
     specific = bool(wanted or explicit_region)
     pool = MARKET_SCAN_DEEP if (specific or region) else count
+    # Remember the budget on the ticket so /setprice can show it as a pricing aid.
+    if budget and budget > 0:
+        try:
+            await db_execute(
+                "UPDATE tickets SET last_budget=$1 WHERE channel_id=$2", budget, channel.id)
+        except Exception as e:
+            print("Budget save failed:", e)
     res = await lzt_search_market(game, budget=budget, count=count, pool=pool, cheapest=specific)
     if not res["ok"]:
         await channel.send(f"⚠️ I couldn't reach the stock right now (`{res['error']}`). "
