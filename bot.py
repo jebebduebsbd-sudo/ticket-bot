@@ -64,6 +64,10 @@ REVIEW_ENFORCE_REP = (os.getenv("REVIEW_ENFORCE_REP", "1") or "1").lower() not i
 REVIEW_SPAM_TIMEOUT_AFTER = int(os.getenv("REVIEW_SPAM_TIMEOUT_AFTER", "2") or "2")
 REVIEW_SPAM_TIMEOUT_MINUTES = int(os.getenv("REVIEW_SPAM_TIMEOUT_MINUTES", "10") or "10")
 REVIEW_SPAM_WINDOW_MINUTES = int(os.getenv("REVIEW_SPAM_WINDOW_MINUTES", "60") or "60")
+# Live vouch counter: which channel holds the always-visible "Vouches: N" message.
+# Defaults to the reviews channel. Placed with /vouch_counter, then auto-updated on
+# every +rep (and when a +rep post is deleted).
+VOUCH_COUNTER_CHANNEL_ID = int(os.getenv("VOUCH_COUNTER_CHANNEL_ID", "0") or "0") or REPS_CHANNEL_ID
 # Terms of Service channel — linked again at card checkout.
 TOS_CHANNEL_ID = int(os.getenv("TOS_CHANNEL_ID", "1485235773606199326") or "0")
 
@@ -391,6 +395,8 @@ ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_handled BOOLEAN NOT NULL DEFAULT
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS verified_order_id TEXT NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS verified_product TEXT NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reserved_market_item_id BIGINT NULL;
+-- Last budget the customer searched with, so /setprice can show it as a pricing aid.
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_budget NUMERIC NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS restock_alerted BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_payment_id TEXT NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_amount NUMERIC NULL;
@@ -3578,6 +3584,43 @@ async def vouches_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e, files=embed_files())
 
 
+@bot.tree.command(name="vouch_counter",
+                  description="Place/refresh the always-visible vouch counter (auto-updates on every +rep).")
+@staff_only()
+async def vouch_counter_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use in a server.", ephemeral=True)
+        return
+    channel = await resolve_text_channel(guild, VOUCH_COUNTER_CHANNEL_ID) if VOUCH_COUNTER_CHANNEL_ID else None
+    if channel is None:
+        await interaction.response.send_message(
+            "⚠️ No vouch-counter channel configured (set `VOUCH_COUNTER_CHANNEL_ID` or "
+            "`REPS_CHANNEL_ID`) or I can't see it.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    flag = f"vouch_counter_msg:{guild.id}"
+    prev = await db_fetchrow("SELECT value FROM bot_meta WHERE key=$1", flag)
+    if prev and prev["value"]:
+        try:
+            old = await channel.fetch_message(int(prev["value"]))
+            await old.delete()
+        except Exception:
+            pass
+    msg = await channel.send(embed=_vouch_counter_embed(await vouch_total(guild.id)))
+    try:
+        await msg.pin()
+    except Exception as e:
+        print("Vouch counter pin failed:", e)
+    await db_execute(
+        "INSERT INTO bot_meta(key, value) VALUES ($1,$2) "
+        "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+        flag, str(msg.id))
+    await interaction.followup.send(
+        f"✅ Vouch counter placed in {channel.mention} — it'll update on every +rep.",
+        ephemeral=True)
+
+
 @bot.tree.command(name="review_guide",
                   description="Post & pin the 'how to leave a review' format guide in the reviews channel.")
 @staff_only()
@@ -3651,19 +3694,29 @@ async def claim_command(interaction: discord.Interaction):
 @bot.tree.command(name="setprice",
                   description="Set the customer's price (custom) and post their checkout.")
 @staff_only()
-@app_commands.describe(amount="Account price in EUR (card adds its fee automatically)")
-async def setprice_command(interaction: discord.Interaction, amount: float):
+@app_commands.describe(amount="Account price in EUR (leave empty to see cost/budget first)")
+async def setprice_command(interaction: discord.Interaction, amount: float | None = None):
     channel = interaction.channel
     if not isinstance(channel, discord.TextChannel):
         await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.response.send_message("Enter a price greater than 0.", ephemeral=True)
         return
     row = await db_fetchrow(
         "SELECT checkout_method FROM tickets WHERE channel_id=$1", channel.id)
     if not row:
         await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
+        return
+    # No amount → just show the staff-only pricing aid (cost, budget, suggested).
+    if amount is None:
+        aid = await pricing_aid_embed(channel)
+        if aid is None:
+            await interaction.response.send_message(
+                "No account is reserved in this ticket yet, so there's nothing to price. "
+                "Reserve one first, then run `/setprice <amount>`.", ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=aid, ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("Enter a price greater than 0.", ephemeral=True)
         return
     method = (row["checkout_method"] or "").lower()
     await interaction.response.defer(ephemeral=True)
@@ -5200,9 +5253,36 @@ async def post_card_checkout(channel: discord.TextChannel, account_price: float)
     await channel.send(embed=e)
 
 
+async def pricing_aid_embed(channel: discord.TextChannel) -> discord.Embed | None:
+    """A staff-only card showing what the reserved account costs us, the customer's
+    budget, and a suggested price — so custom pricing is an informed two-second call."""
+    row = await db_fetchrow(
+        "SELECT reserved_market_item_id, last_budget FROM tickets WHERE channel_id=$1",
+        channel.id)
+    if not row or not row["reserved_market_item_id"]:
+        return None
+    det = await lzt_item_detail(row["reserved_market_item_id"])
+    if not det["ok"]:
+        return None
+    src, resale = _resale_price(det["item"] or {})
+    budget = float(row["last_budget"]) if row["last_budget"] is not None else None
+    title = (det["item"] or {}).get("title") or "Account"
+    suggested = budget if budget else resale
+    lines = [f"**Your cost:** €{src:.2f}"]
+    if budget:
+        lines.append(f"**Customer budget:** €{budget:.0f}")
+    lines.append(f"**Suggested:** €{suggested:.0f}  ·  run `/setprice {suggested:.0f}`")
+    e = discord.Embed(
+        title="💰 Pricing aid",
+        description=f"**{str(title)[:120]}**\n\n" + "\n".join(lines),
+        color=AF_BLUE)
+    e.set_footer(text="Staff only — the customer never sees this.")
+    return e
+
+
 async def notify_staff_set_price(channel: discord.TextChannel, method: str) -> None:
     """Ping the handler (the claimer, or the staff role) to set a custom price with
-    /setprice, which then posts the customer's checkout."""
+    /setprice, and drop a staff-only pricing aid (cost/budget/suggested) in the log."""
     who = None
     row = await db_fetchrow("SELECT claimed_by FROM tickets WHERE channel_id=$1", channel.id)
     if row and row["claimed_by"]:
@@ -5217,6 +5297,16 @@ async def notify_staff_set_price(channel: discord.TextChannel, method: str) -> N
             allowed_mentions=discord.AllowedMentions(roles=True, users=True))
     except Exception as e:
         print("Set-price nudge failed:", e)
+    # Cost/budget/suggested go to the staff log (never the ticket the customer sees).
+    try:
+        aid = await pricing_aid_embed(channel)
+        if aid is not None:
+            log_ch = await get_log_channel(channel.guild)
+            if log_ch is not None:
+                aid.add_field(name="Ticket", value=channel.mention, inline=False)
+                await log_ch.send(embed=aid)
+    except Exception as e:
+        print("Pricing aid post failed:", e)
 
 
 MARKET_SCAN_DEEP = 40  # how many listings to inspect when filtering a specific request
@@ -5272,6 +5362,13 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
     # a deep pool so there are enough EU listings to choose from.
     specific = bool(wanted or explicit_region)
     pool = MARKET_SCAN_DEEP if (specific or region) else count
+    # Remember the budget on the ticket so /setprice can show it as a pricing aid.
+    if budget and budget > 0:
+        try:
+            await db_execute(
+                "UPDATE tickets SET last_budget=$1 WHERE channel_id=$2", budget, channel.id)
+        except Exception as e:
+            print("Budget save failed:", e)
     res = await lzt_search_market(game, budget=budget, count=count, pool=pool, cheapest=specific)
     if not res["ok"]:
         await channel.send(f"⚠️ I couldn't reach the stock right now (`{res['error']}`). "
@@ -5812,6 +5909,32 @@ async def vouch_total(guild_id: int) -> int:
     return int(row["n"]) if row else 0
 
 
+def _vouch_counter_embed(total: int) -> discord.Embed:
+    return discord.Embed(
+        title="⭐  AF SERVICES — Vouches",
+        description=f"## {total:,} verified +rep and counting! 💙",
+        color=AF_BLUE)
+
+
+async def update_vouch_counter(guild: discord.Guild | None) -> None:
+    """Refresh the always-visible vouch-counter message, if staff have placed one
+    (via /vouch_counter). No-op otherwise, so it never posts uninvited."""
+    if guild is None or not VOUCH_COUNTER_CHANNEL_ID:
+        return
+    row = await db_fetchrow("SELECT value FROM bot_meta WHERE key=$1",
+                            f"vouch_counter_msg:{guild.id}")
+    if not row or not row["value"]:
+        return
+    channel = await resolve_text_channel(guild, VOUCH_COUNTER_CHANNEL_ID)
+    if channel is None:
+        return
+    try:
+        msg = await channel.fetch_message(int(row["value"]))
+        await msg.edit(embed=_vouch_counter_embed(await vouch_total(guild.id)))
+    except Exception as e:
+        print("Vouch counter update failed:", e)
+
+
 async def record_vouch(message: discord.Message) -> int | None:
     """Count a +rep post. Returns the server's new vouch total, or None when this
     message was already counted (so a re-processed post never inflates it)."""
@@ -5979,6 +6102,32 @@ async def _reply_negative_review(message: discord.Message) -> None:
         print("Negative-review reply send failed:", e)
 
 
+async def alert_staff_negative_review(message: discord.Message) -> None:
+    """Ping staff in the log channel the moment a -rep lands, so someone can jump on
+    the unhappy customer fast (this is where refunds/retention are won)."""
+    guild = message.guild
+    if guild is None:
+        return
+    log_ch = await get_log_channel(guild)
+    if log_ch is None:
+        return
+    member = message.author
+    text = (message.content or "").strip() or "*(no text)*"
+    who = f"<@&{OWNER_ROLE_ID}>" if OWNER_ROLE_ID else (f"<@&{STAFF_ROLE_ID}>" if STAFF_ROLE_ID else "")
+    e = discord.Embed(
+        title="⚠️ Negative review (-rep) just posted",
+        description=(f"**Customer:** {member.mention} (`{member.id}`)\n"
+                     f"**Review:** {text[:1500]}\n\n"
+                     f"[Jump to the post]({message.jump_url})"),
+        color=0xE74C3C)
+    e.set_footer(text="Reach out fast — offer a fix/compensation to turn it around.")
+    try:
+        await log_ch.send(content=who or None, embed=e,
+                          allowed_mentions=discord.AllowedMentions(roles=True))
+    except Exception as e2:
+        print("Negative-review staff alert failed:", e2)
+
+
 async def _grant_customer_role_and_close(guild: discord.Guild, member: discord.Member) -> None:
     """Give the customer role (skip staff) and auto-close their open ticket(s)."""
     if CUSTOMER_ROLE_ID and not is_staff(member):
@@ -6117,6 +6266,7 @@ async def handle_review_post(message: discord.Message) -> None:
             return
         await record_review(message, "minus")
         await _reply_negative_review(message)
+        await alert_staff_negative_review(message)
         return
 
     # Positive review → heart it, count the vouch, grant role, close their tickets.
@@ -6134,6 +6284,7 @@ async def handle_review_post(message: discord.Message) -> None:
                     mention_author=False)
             except Exception as e:
                 print("Vouch count reply failed:", e)
+        await update_vouch_counter(guild)
         await _grant_customer_role_and_close(guild, member)
         return
 
@@ -6251,6 +6402,7 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     # A removed +rep (fake vouch, cleanup, self-delete) shouldn't stay in the total.
     if REPS_CHANNEL_ID and payload.channel_id == REPS_CHANNEL_ID:
         await uncount_vouch(payload.message_id)
+        await update_vouch_counter(bot.get_guild(payload.guild_id) if payload.guild_id else None)
 
 
 @bot.event
@@ -6259,6 +6411,7 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
     if REPS_CHANNEL_ID and payload.channel_id == REPS_CHANNEL_ID:
         for mid in payload.message_ids:
             await uncount_vouch(mid)
+        await update_vouch_counter(bot.get_guild(payload.guild_id) if payload.guild_id else None)
 
 
 @bot.event
@@ -6464,27 +6617,20 @@ async def review_reminder_loop():
     """DM buyers a review reminder some hours after delivery (once)."""
     if REVIEW_REMINDER_HOURS <= 0:
         return
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
     rows = await db_fetch(
         "SELECT id, owner_id FROM deliveries WHERE review_reminded=FALSE "
         "AND delivered_at < NOW() - make_interval(hours => $1) "
         "AND delivered_at > NOW() - INTERVAL '3 days' LIMIT 20",
         max(1, int(REVIEW_REMINDER_HOURS)))
-    reps = f"<#{REPS_CHANNEL_ID}>" if REPS_CHANNEL_ID else "our reviews channel"
     for r in rows:
         await db_execute("UPDATE deliveries SET review_reminded=TRUE WHERE id=$1", r["id"])
-        # Don't nag buyers who already left a +rep/-rep.
-        if await has_reviewed(GUILD_ID, int(r["owner_id"])):
-            continue
-        try:
-            user = await bot.fetch_user(int(r["owner_id"]))
-            await user.send(embed=discord.Embed(
-                title="⭐  Enjoying your account?",
-                description=(f"If everything's working great, we'd love a quick **+rep** in "
-                            f"{reps} — it really helps us out! 💙\n\nHaving any issues? Just open "
-                            f"a ticket and we'll sort it."),
-                color=AF_BLUE))
-        except Exception as e:
-            print("Review reminder DM failed:", e)
+        # Route through the shared prompt so the once-a-day cooldown is respected and a
+        # buyer already nudged at ticket-close (or who already reviewed) isn't asked
+        # again — no more double nudges.
+        await prompt_for_review(guild, int(r["owner_id"]))
 
 
 @tasks.loop(minutes=30)
@@ -6551,6 +6697,37 @@ async def low_stock_loop():
 # ============================================================
 # READY
 # ============================================================
+async def startup_permission_check(guild: discord.Guild) -> None:
+    """Warn (console + staff log) if the bot lacks permissions the newer features
+    need, so a silent 'why isn't it deleting spam / timing out' never happens."""
+    me = guild.me
+    if me is None:
+        return
+    warnings: list[str] = []
+    if not me.guild_permissions.moderate_members:
+        warnings.append("**Moderate Members** — needed to time out review spammers")
+    if REPS_CHANNEL_ID:
+        ch = guild.get_channel(REPS_CHANNEL_ID)
+        if isinstance(ch, discord.TextChannel):
+            perms = ch.permissions_for(me)
+            if not perms.manage_messages:
+                warnings.append(f"**Manage Messages** in {ch.mention} — needed to remove tag-less review posts")
+            if not perms.add_reactions:
+                warnings.append(f"**Add Reactions** in {ch.mention} — needed to ❤️ +rep posts")
+    if not warnings:
+        print("🔐 Permission check: all required permissions present.")
+        return
+    text = ("⚠️ **Missing permissions** — some features won't work until these are granted:\n• "
+            + "\n• ".join(warnings))
+    print("🔐 " + text.replace("**", ""))
+    log_ch = await get_log_channel(guild)
+    if log_ch is not None:
+        try:
+            await log_ch.send(text)
+        except Exception:
+            pass
+
+
 @bot.event
 async def on_ready():
     await ensure_db()
@@ -6594,6 +6771,10 @@ async def on_ready():
     guild = bot.get_guild(GUILD_ID)
     if guild is not None:
         asyncio.create_task(backfill_vouches(guild))
+        try:
+            await startup_permission_check(guild)
+        except Exception as e:
+            print("Permission check failed:", e)
 
     print(f"✅ Ticket bot online as {bot.user}")
     print(f"🖼️  Asset dir: {ASSET_DIR}")
@@ -6618,4 +6799,5 @@ async def on_ready():
           f" • counted so far: {vouches_now}")
 
 
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
