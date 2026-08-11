@@ -64,6 +64,10 @@ REVIEW_ENFORCE_REP = (os.getenv("REVIEW_ENFORCE_REP", "1") or "1").lower() not i
 REVIEW_SPAM_TIMEOUT_AFTER = int(os.getenv("REVIEW_SPAM_TIMEOUT_AFTER", "2") or "2")
 REVIEW_SPAM_TIMEOUT_MINUTES = int(os.getenv("REVIEW_SPAM_TIMEOUT_MINUTES", "10") or "10")
 REVIEW_SPAM_WINDOW_MINUTES = int(os.getenv("REVIEW_SPAM_WINDOW_MINUTES", "60") or "60")
+# Live vouch counter: which channel holds the always-visible "Vouches: N" message.
+# Defaults to the reviews channel. Placed with /vouch_counter, then auto-updated on
+# every +rep (and when a +rep post is deleted).
+VOUCH_COUNTER_CHANNEL_ID = int(os.getenv("VOUCH_COUNTER_CHANNEL_ID", "0") or "0") or REPS_CHANNEL_ID
 # Terms of Service channel — linked again at card checkout.
 TOS_CHANNEL_ID = int(os.getenv("TOS_CHANNEL_ID", "1485235773606199326") or "0")
 
@@ -3580,6 +3584,43 @@ async def vouches_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e, files=embed_files())
 
 
+@bot.tree.command(name="vouch_counter",
+                  description="Place/refresh the always-visible vouch counter (auto-updates on every +rep).")
+@staff_only()
+async def vouch_counter_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use in a server.", ephemeral=True)
+        return
+    channel = await resolve_text_channel(guild, VOUCH_COUNTER_CHANNEL_ID) if VOUCH_COUNTER_CHANNEL_ID else None
+    if channel is None:
+        await interaction.response.send_message(
+            "⚠️ No vouch-counter channel configured (set `VOUCH_COUNTER_CHANNEL_ID` or "
+            "`REPS_CHANNEL_ID`) or I can't see it.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    flag = f"vouch_counter_msg:{guild.id}"
+    prev = await db_fetchrow("SELECT value FROM bot_meta WHERE key=$1", flag)
+    if prev and prev["value"]:
+        try:
+            old = await channel.fetch_message(int(prev["value"]))
+            await old.delete()
+        except Exception:
+            pass
+    msg = await channel.send(embed=_vouch_counter_embed(await vouch_total(guild.id)))
+    try:
+        await msg.pin()
+    except Exception as e:
+        print("Vouch counter pin failed:", e)
+    await db_execute(
+        "INSERT INTO bot_meta(key, value) VALUES ($1,$2) "
+        "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+        flag, str(msg.id))
+    await interaction.followup.send(
+        f"✅ Vouch counter placed in {channel.mention} — it'll update on every +rep.",
+        ephemeral=True)
+
+
 @bot.tree.command(name="review_guide",
                   description="Post & pin the 'how to leave a review' format guide in the reviews channel.")
 @staff_only()
@@ -5868,6 +5909,32 @@ async def vouch_total(guild_id: int) -> int:
     return int(row["n"]) if row else 0
 
 
+def _vouch_counter_embed(total: int) -> discord.Embed:
+    return discord.Embed(
+        title="⭐  AF SERVICES — Vouches",
+        description=f"## {total:,} verified +rep and counting! 💙",
+        color=AF_BLUE)
+
+
+async def update_vouch_counter(guild: discord.Guild | None) -> None:
+    """Refresh the always-visible vouch-counter message, if staff have placed one
+    (via /vouch_counter). No-op otherwise, so it never posts uninvited."""
+    if guild is None or not VOUCH_COUNTER_CHANNEL_ID:
+        return
+    row = await db_fetchrow("SELECT value FROM bot_meta WHERE key=$1",
+                            f"vouch_counter_msg:{guild.id}")
+    if not row or not row["value"]:
+        return
+    channel = await resolve_text_channel(guild, VOUCH_COUNTER_CHANNEL_ID)
+    if channel is None:
+        return
+    try:
+        msg = await channel.fetch_message(int(row["value"]))
+        await msg.edit(embed=_vouch_counter_embed(await vouch_total(guild.id)))
+    except Exception as e:
+        print("Vouch counter update failed:", e)
+
+
 async def record_vouch(message: discord.Message) -> int | None:
     """Count a +rep post. Returns the server's new vouch total, or None when this
     message was already counted (so a re-processed post never inflates it)."""
@@ -6217,6 +6284,7 @@ async def handle_review_post(message: discord.Message) -> None:
                     mention_author=False)
             except Exception as e:
                 print("Vouch count reply failed:", e)
+        await update_vouch_counter(guild)
         await _grant_customer_role_and_close(guild, member)
         return
 
@@ -6334,6 +6402,7 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     # A removed +rep (fake vouch, cleanup, self-delete) shouldn't stay in the total.
     if REPS_CHANNEL_ID and payload.channel_id == REPS_CHANNEL_ID:
         await uncount_vouch(payload.message_id)
+        await update_vouch_counter(bot.get_guild(payload.guild_id) if payload.guild_id else None)
 
 
 @bot.event
@@ -6342,6 +6411,7 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
     if REPS_CHANNEL_ID and payload.channel_id == REPS_CHANNEL_ID:
         for mid in payload.message_ids:
             await uncount_vouch(mid)
+        await update_vouch_counter(bot.get_guild(payload.guild_id) if payload.guild_id else None)
 
 
 @bot.event
