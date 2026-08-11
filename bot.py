@@ -6799,4 +6799,5 @@ async def on_ready():
           f" • counted so far: {vouches_now}")
 
 
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
