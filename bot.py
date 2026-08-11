@@ -6617,27 +6617,20 @@ async def review_reminder_loop():
     """DM buyers a review reminder some hours after delivery (once)."""
     if REVIEW_REMINDER_HOURS <= 0:
         return
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
     rows = await db_fetch(
         "SELECT id, owner_id FROM deliveries WHERE review_reminded=FALSE "
         "AND delivered_at < NOW() - make_interval(hours => $1) "
         "AND delivered_at > NOW() - INTERVAL '3 days' LIMIT 20",
         max(1, int(REVIEW_REMINDER_HOURS)))
-    reps = f"<#{REPS_CHANNEL_ID}>" if REPS_CHANNEL_ID else "our reviews channel"
     for r in rows:
         await db_execute("UPDATE deliveries SET review_reminded=TRUE WHERE id=$1", r["id"])
-        # Don't nag buyers who already left a +rep/-rep.
-        if await has_reviewed(GUILD_ID, int(r["owner_id"])):
-            continue
-        try:
-            user = await bot.fetch_user(int(r["owner_id"]))
-            await user.send(embed=discord.Embed(
-                title="⭐  Enjoying your account?",
-                description=(f"If everything's working great, we'd love a quick **+rep** in "
-                            f"{reps} — it really helps us out! 💙\n\nHaving any issues? Just open "
-                            f"a ticket and we'll sort it."),
-                color=AF_BLUE))
-        except Exception as e:
-            print("Review reminder DM failed:", e)
+        # Route through the shared prompt so the once-a-day cooldown is respected and a
+        # buyer already nudged at ticket-close (or who already reviewed) isn't asked
+        # again — no more double nudges.
+        await prompt_for_review(guild, int(r["owner_id"]))
 
 
 @tasks.loop(minutes=30)
@@ -6704,6 +6697,37 @@ async def low_stock_loop():
 # ============================================================
 # READY
 # ============================================================
+async def startup_permission_check(guild: discord.Guild) -> None:
+    """Warn (console + staff log) if the bot lacks permissions the newer features
+    need, so a silent 'why isn't it deleting spam / timing out' never happens."""
+    me = guild.me
+    if me is None:
+        return
+    warnings: list[str] = []
+    if not me.guild_permissions.moderate_members:
+        warnings.append("**Moderate Members** — needed to time out review spammers")
+    if REPS_CHANNEL_ID:
+        ch = guild.get_channel(REPS_CHANNEL_ID)
+        if isinstance(ch, discord.TextChannel):
+            perms = ch.permissions_for(me)
+            if not perms.manage_messages:
+                warnings.append(f"**Manage Messages** in {ch.mention} — needed to remove tag-less review posts")
+            if not perms.add_reactions:
+                warnings.append(f"**Add Reactions** in {ch.mention} — needed to ❤️ +rep posts")
+    if not warnings:
+        print("🔐 Permission check: all required permissions present.")
+        return
+    text = ("⚠️ **Missing permissions** — some features won't work until these are granted:\n• "
+            + "\n• ".join(warnings))
+    print("🔐 " + text.replace("**", ""))
+    log_ch = await get_log_channel(guild)
+    if log_ch is not None:
+        try:
+            await log_ch.send(text)
+        except Exception:
+            pass
+
+
 @bot.event
 async def on_ready():
     await ensure_db()
@@ -6747,6 +6771,10 @@ async def on_ready():
     guild = bot.get_guild(GUILD_ID)
     if guild is not None:
         asyncio.create_task(backfill_vouches(guild))
+        try:
+            await startup_permission_check(guild)
+        except Exception as e:
+            print("Permission check failed:", e)
 
     print(f"✅ Ticket bot online as {bot.user}")
     print(f"🖼️  Asset dir: {ASSET_DIR}")
